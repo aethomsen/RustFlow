@@ -23,6 +23,7 @@ pub(super) fn higgs_jet() {
 
 fn citation(
     id: &str,
+    url: &str,
     reference: &str,
     description: &str,
     bibtex: &str,
@@ -30,6 +31,7 @@ fn citation(
 ) -> Citation {
     Citation {
         id: id.into(),
+        url: url.into(),
         reference: reference.into(),
         bibtex: bibtex.into(),
         reasons,
@@ -61,6 +63,7 @@ pub fn get_citations() -> Vec<Citation> {
     if !amflow2_reasons.is_empty() {
         citations.push(citation(
             "arXiv:2607.08477",
+            "https://arxiv.org/abs/2607.08477",
             "Rui-Jun Huang, Xiao Liu and Yan-Qing Ma. AMFlow 2.0: significant algorithmic and software improvements for Feynman integral evaluation (2026). arXiv:2607.08477.",
             "Efficient differential-equation solving and recursive boundary evaluation.",
             r#"@article{Huang:2026AMFlow2,
@@ -76,6 +79,7 @@ pub fn get_citations() -> Vec<Citation> {
         ));
         citations.push(citation(
             "arXiv:2006.05510",
+            "https://arxiv.org/abs/2006.05510",
             "Martijn Hidding. DiffExp, a Mathematica package for computing Feynman integrals in terms of one-dimensional series expansions (2020). arXiv:2006.05510.",
             "Transport of Feynman integrals by local series expansions.",
             r#"@article{Hidding:2020DiffExp,
@@ -93,6 +97,7 @@ pub fn get_citations() -> Vec<Citation> {
     if used & AUTOMATIC != 0 {
         citations.push(citation(
             "arXiv:2201.11669",
+            "https://arxiv.org/abs/2201.11669",
             "Xiao Liu and Yan-Qing Ma. AMFlow: a Mathematica package for Feynman integrals computation via Auxiliary Mass Flow. Comput. Phys. Commun. 283 (2023) 108565. doi:10.1016/j.cpc.2022.108565.",
             "Feynman integral evaluation through auxiliary mass flow.",
             r#"@article{Liu:2022AMFlow,
@@ -114,6 +119,7 @@ pub fn get_citations() -> Vec<Citation> {
     if used & HIGGS_JET != 0 {
         citations.push(citation(
             "arXiv:2112.07578",
+            "https://arxiv.org/abs/2112.07578",
             "Matteo Becchetti, Francesco Moriello and Armin Schweitzer. Two-loop amplitude for mixed QCD-EW corrections to gg -> Hg. JHEP 04 (2022) 139. doi:10.1007/JHEP04(2022)139.",
             "Two-loop mixed QCD-EW Higgs-plus-jet amplitudes.",
             r#"@article{Becchetti:2021HiggsJet,
