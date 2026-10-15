@@ -1,4 +1,9 @@
+mod native_provider;
+mod native_seeds;
+pub use native_provider::{NativeIdentityProvider, ProvidedRustRedBackend};
 mod scoped_tables;
+pub(crate) use native_seeds::ResolvedIdentityBank;
+pub use native_seeds::{NativeIdentityBank, NativeIdentityLimits, SeededRustRedBackend};
 mod table_graph;
 pub use scoped_tables::ScopedTableBackend;
 
@@ -233,9 +238,34 @@ impl RustRedBackend {
         context: &RunContext,
         cuts: Option<&crate::cuts::CutFamily>,
     ) -> Result<Reduction> {
+        self.reduce_native_with_seed(family, targets, epsilon, context, cuts, None, None)
+    }
+    fn reduce_native_with_seed(
+        &self,
+        family: &IntegralFamily,
+        targets: &[Integral],
+        epsilon: Option<&Rational>,
+        context: &RunContext,
+        cuts: Option<&crate::cuts::CutFamily>,
+        seed: Option<&NativeIdentityBank>,
+        provider: Option<&dyn NativeIdentityProvider>,
+    ) -> Result<Reduction> {
+        if (seed.is_some() || provider.is_some()) && (cuts.is_some() || !self.factorized) {
+            return Err(Error::Unsupported(
+                "supplied native identities require the uncut factorized backend".into(),
+            ));
+        }
+        if provider.is_some() && epsilon.is_some() {
+            return Err(Error::Unsupported(
+                "on-demand identities currently require symbolic epsilon".into(),
+            ));
+        }
         if let Some(cuts) = cuts {
             cuts.validate()?;
         }
+        let resolved_seed = seed
+            .map(|seed| seed.resolve(family, epsilon, context))
+            .transpose()?;
         if self.max_sector_batch == 0 {
             return Err(Error::InvalidInput(
                 "max_sector_batch must be positive".into(),
@@ -274,7 +304,15 @@ impl RustRedBackend {
                 family
             };
             return crate::native::reduce(
-                &converted, original, &dimension, &targets, self, context, cuts,
+                &converted,
+                original,
+                &dimension,
+                &targets,
+                self,
+                context,
+                cuts,
+                resolved_seed.as_ref(),
+                provider,
             );
         }
         let cut_constraint = if let Some(cuts) = cuts {

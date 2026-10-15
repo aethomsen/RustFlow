@@ -88,7 +88,7 @@ impl ScopedTableBackend {
             .collect::<Vec<_>>();
         // The same native sparse graph planner used by every public Reduction
         // call validates the complete immutable supplied table once at admission.
-        reduction.expand_many(&targets)?;
+        super::table_graph::validate(&reduction, &targets)?;
         self.tables.insert(
             key,
             TableBackend {
@@ -106,7 +106,7 @@ impl ScopedTableBackend {
         self.tables.is_empty()
     }
 
-    fn table(&self, family: &IntegralFamily) -> Result<&TableBackend> {
+    pub(super) fn table(&self, family: &IntegralFamily) -> Result<&TableBackend> {
         let key = scope_key(family)?;
         self.tables.get(&key).ok_or_else(|| Error::IncompleteReduction(format!(
             "no supplied reduction table for exact family {} ({key}); auxiliary deformations, specializations and recursive boundary families require separate entries",

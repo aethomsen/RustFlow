@@ -64,6 +64,75 @@ pub(super) fn expand_many(
             })
             .collect();
     }
+    let Plan {
+        graph,
+        nodes,
+        roots,
+        order,
+        mut uses,
+    } = plan(reduction, targets)?;
+    let mut expanded = BTreeMap::<NodeIndex, LinearCombination>::new();
+    for &node in &order {
+        let mut value = LinearCombination::new();
+        if let Some(terms) = reduction.rules.get(graph[node]) {
+            for (child, coefficient) in terms {
+                let child_node = nodes[child];
+                let child_value = expanded.get(&child_node).ok_or_else(|| {
+                    Error::IncompleteReduction("native reduction graph lost a dependency".into())
+                })?;
+                for (terminal, weight) in child_value {
+                    let old = value.remove(terminal).unwrap_or_default();
+                    value.insert(
+                        terminal.clone(),
+                        (old + coefficient * weight).together().cancel(),
+                    );
+                }
+                uses[child_node.0] -= 1;
+                if uses[child_node.0] == 0 {
+                    expanded.remove(&child_node);
+                }
+            }
+            value.retain(|_, coefficient| !coefficient.is_zero());
+        } else {
+            value.insert(graph[node].clone(), Atom::one());
+        }
+        expanded.insert(node, value);
+    }
+    roots
+        .into_iter()
+        .map(|root| {
+            expanded
+                .remove(&root)
+                .map(|value| (graph[root].clone(), value))
+                .ok_or_else(|| {
+                    Error::IncompleteReduction(
+                        "native reduction graph lost a requested root".into(),
+                    )
+                })
+        })
+        .collect()
+}
+
+/// The existing sparse native dependency plan, separated from coefficient
+/// arithmetic so table admission need not expand every declared root.
+struct Plan<'a> {
+    graph: Graph<'a>,
+    nodes: BTreeMap<&'a Integral, NodeIndex>,
+    roots: BTreeSet<NodeIndex>,
+    order: Vec<NodeIndex>,
+    uses: Vec<usize>,
+}
+
+pub(super) fn validate(reduction: &Reduction, targets: &[Integral]) -> Result<()> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let _ = plan(reduction, targets)?;
+    Ok(())
+}
+
+fn plan<'a>(reduction: &'a Reduction, targets: &'a [Integral]) -> Result<Plan<'a>> {
+    let residuals = reduction.residuals.iter().collect::<BTreeSet<_>>();
     let keys = reduction
         .rules
         .iter()
@@ -149,44 +218,11 @@ pub(super) fn expand_many(
                 .ok_or_else(|| Error::Limit("reduction dependency use count overflow".into()))?;
         }
     }
-    let mut expanded = BTreeMap::<NodeIndex, LinearCombination>::new();
-    for &node in &order {
-        let mut value = LinearCombination::new();
-        if let Some(terms) = reduction.rules.get(graph[node]) {
-            for (child, coefficient) in terms {
-                let child_node = nodes[child];
-                let child_value = expanded.get(&child_node).ok_or_else(|| {
-                    Error::IncompleteReduction("native reduction graph lost a dependency".into())
-                })?;
-                for (terminal, weight) in child_value {
-                    let old = value.remove(terminal).unwrap_or_default();
-                    value.insert(
-                        terminal.clone(),
-                        (old + coefficient * weight).together().cancel(),
-                    );
-                }
-                uses[child_node.0] -= 1;
-                if uses[child_node.0] == 0 {
-                    expanded.remove(&child_node);
-                }
-            }
-            value.retain(|_, coefficient| !coefficient.is_zero());
-        } else {
-            value.insert(graph[node].clone(), Atom::one());
-        }
-        expanded.insert(node, value);
-    }
-    roots
-        .into_iter()
-        .map(|root| {
-            expanded
-                .remove(&root)
-                .map(|value| (graph[root].clone(), value))
-                .ok_or_else(|| {
-                    Error::IncompleteReduction(
-                        "native reduction graph lost a requested root".into(),
-                    )
-                })
-        })
-        .collect()
+    Ok(Plan {
+        graph,
+        nodes,
+        roots,
+        order,
+        uses,
+    })
 }

@@ -37,7 +37,6 @@ pub mod epsilon_shearing;
 pub mod error;
 pub mod family;
 mod fixed_series;
-mod series_limits;
 pub mod frobenius;
 #[cfg(feature = "automatic")]
 pub mod ft;
@@ -83,6 +82,7 @@ pub mod regions;
 mod root_path;
 #[cfg(feature = "automatic")]
 mod sample_checkpoint;
+mod series_limits;
 pub mod singular_endpoint;
 #[cfg(feature = "automatic")]
 pub mod tensor;
@@ -120,5 +120,8 @@ pub use physical_targets::ProjectedLaurentExpansion;
 pub use physical_transport::RustFlow;
 pub use projections::{ProjectionFactors, SampleNormalization};
 #[cfg(feature = "automatic")]
-pub use reduction::{ReductionBackend, RustRedBackend, ScopedTableBackend, TableBackend};
+pub use reduction::{
+    NativeIdentityBank, NativeIdentityLimits, NativeIdentityProvider, ProvidedRustRedBackend,
+    ReductionBackend, RustRedBackend, ScopedTableBackend, SeededRustRedBackend, TableBackend,
+};
 pub use transport_cache::RustFlowCache;

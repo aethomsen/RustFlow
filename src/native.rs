@@ -26,6 +26,8 @@ pub(crate) fn reduce(
     options: &RustRedBackend,
     context: &RunContext,
     cuts: Option<&crate::cuts::CutFamily>,
+    seed: Option<&crate::reduction::ResolvedIdentityBank>,
+    provider: Option<&dyn crate::reduction::NativeIdentityProvider>,
 ) -> Result<Reduction> {
     let cut_options;
     let options = if cuts.is_some() {
@@ -41,7 +43,7 @@ pub(crate) fn reduce(
     };
     rustred::dispatch_arity!(
         family.family.denominator_count(),
-        solve(family, original, dimension, targets, options, context, cuts),
+        solve(family, original, dimension, targets, options, context, cuts, seed, provider),
         n => Err(Error::Unsupported(format!(
             "native runtime was compiled for {:?} scalar-product slots; received {n}",
             rustred::compiled_runtime_arities()
@@ -60,6 +62,117 @@ fn cut_stage_key(key: String, cuts: Option<&str>) -> String {
 }
 fn native_error(error: impl std::fmt::Display) -> Error {
     Error::Reduction(error.to_string())
+}
+fn provider_key(
+    key: String,
+    provider: Option<&dyn crate::reduction::NativeIdentityProvider>,
+) -> String {
+    provider.map_or(key.clone(), |p| {
+        format!(
+            "provider-v1-{}",
+            blake3::hash(format!("{}:{}:{key}", p.identity(), p.max_calls()).as_bytes()).to_hex()
+        )
+    })
+}
+fn identity_seed_key(key: String, seed: Option<&crate::reduction::ResolvedIdentityBank>) -> String {
+    seed.map_or_else(
+        || key.clone(),
+        |seed| {
+            format!(
+                "identity-seed-v1-{}",
+                blake3::hash(format!("{}:{key}", seed.identity).as_bytes()).to_hex()
+            )
+        },
+    )
+}
+
+/// Reuse verified equations before counting solver searches. Supplied residuals
+/// are only declarations for table admission; they never establish that a leaf
+/// has been searched. The bank has its own independent, immutable budget.
+fn validate_identity_order<const N: usize>(
+    seed: &crate::reduction::ResolvedIdentityBank,
+    original: &IntegralFamily,
+    dimension: &Atom,
+    options: &RustRedBackend,
+    context: &RunContext,
+) -> Result<BTreeSet<[i16; N]>> {
+    let mut supplied = BTreeSet::new();
+    let mut orders = BTreeMap::new();
+    for (lhs, terms) in &seed.reduction.rules {
+        context.cancellation.check()?;
+        let powers: [i16; N] = lhs
+            .0
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::InvalidInput("supplied native identity arity".into()))?;
+        let sector = powers.map(|p| p > 0);
+        if let std::collections::btree_map::Entry::Vacant(entry) = orders.entry(sector) {
+            let mut order = rustred::solver::IntegralOrder::new(sector, [false; N]);
+            if options.bubble_subloops {
+                if let Some(pattern) =
+                    crate::bubble::Bubble::find(original, &sector, dimension.clone())?
+                {
+                    order = order
+                        .with_permutation(pattern.permutation().try_into().map_err(|_| {
+                            Error::InvalidInput("supplied identity bubble permutation arity".into())
+                        })?)
+                        .map_err(native_error)?;
+                }
+            }
+            entry.insert(order);
+        }
+        let left = rustred::solver::Integral::numeric(powers).map_err(native_error)?;
+        for rhs in terms.keys() {
+            let right: [i16; N] = rhs
+                .0
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::InvalidInput("supplied identity RHS arity".into()))?;
+            let right = rustred::solver::Integral::numeric(right).map_err(native_error)?;
+            if orders[&sector].compare(&left, &right) != std::cmp::Ordering::Less {
+                return Err(Error::InvalidInput(
+                    "supplied native identity does not strictly descend the active native order"
+                        .into(),
+                ));
+            }
+        }
+        supplied.insert(powers);
+    }
+    Ok(supplied)
+}
+fn admit_identity_seed<const N: usize>(
+    seed: &crate::reduction::ResolvedIdentityBank,
+    original: &IntegralFamily,
+    dimension: &Atom,
+    options: &RustRedBackend,
+    context: &RunContext,
+    result: &mut Reduction,
+    cache: &mut FrontierCache,
+    visited: &mut BTreeSet<[i16; N]>,
+    pending: &mut BTreeSet<[i16; N]>,
+    targets: &[Vec<i16>],
+) -> Result<()> {
+    let supplied = validate_identity_order::<N>(seed, original, dimension, options, context)?;
+    result
+        .nonzero_conditions
+        .extend(seed.reduction.nonzero_conditions.iter().cloned());
+    cache.insert_rules(result, seed.reduction.rules.clone());
+    // A reusable family bank labels every stored LHS as done. Supplied LHSs
+    // belong to the separately bounded equation bank, not the search budget.
+    // No unrelated searched index is removed, and unknown leaves stay pending.
+    visited.retain(|powers| !supplied.contains(powers));
+    *pending = structural_frontier(result, targets, context)?
+        .into_iter()
+        .map(|i| {
+            let powers: [i16; N] =
+                i.0.as_slice()
+                    .try_into()
+                    .map_err(|_| Error::Reduction("seeded frontier arity".into()))?;
+            Ok(powers)
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    pending.retain(|powers| !visited.contains(powers));
+    Ok(())
 }
 fn family_stage_key(
     family: &ConvertedFamily,
@@ -217,6 +330,8 @@ fn solve<const N: usize>(
     options: &RustRedBackend,
     context: &RunContext,
     cuts: Option<&crate::cuts::CutFamily>,
+    seed: Option<&crate::reduction::ResolvedIdentityBank>,
+    provider: Option<&dyn crate::reduction::NativeIdentityProvider>,
 ) -> Result<Reduction> {
     let mut pending = targets
         .iter()
@@ -316,7 +431,10 @@ fn solve<const N: usize>(
         )
         .to_hex()
         .to_string();
-        cut_stage_key(raw, cut_key.as_deref())
+        provider_key(
+            identity_seed_key(cut_stage_key(raw, cut_key.as_deref()), seed),
+            provider,
+        )
     };
     let stage_key_for_depth = |depth| {
         let legacy_key = legacy_key_for_depth(depth);
@@ -337,9 +455,15 @@ fn solve<const N: usize>(
     };
     let legacy_key = legacy_key_for_depth(options.max_depth);
     let stage_key = stage_key_for_depth(options.max_depth);
-    let family_key = cut_stage_key(
-        family_stage_key(family, original.physical_propagators, options),
-        cut_key.as_deref(),
+    let family_key = provider_key(
+        identity_seed_key(
+            cut_stage_key(
+                family_stage_key(family, original.physical_propagators, options),
+                cut_key.as_deref(),
+            ),
+            seed,
+        ),
+        provider,
     );
     let mut patterns = BTreeMap::<[bool; N], Option<crate::bubble::Bubble>>::new();
     let mut restart = if let Some(directory) = &options.checkpoints {
@@ -401,7 +525,14 @@ fn solve<const N: usize>(
         && let Some(directory) = &options.checkpoints
         && let Some((bank, _, _)) = crate::cache::read_native_stage(directory, &family_key)?
     {
-        restart = Some(restrict_family_stage(bank, targets, context)?);
+        let (bank, mut done, remaining) = restrict_family_stage(bank, targets, context)?;
+        if provider.is_some() {
+            // Family banks store reusable equations, not search history. In the
+            // dynamic-provider lane their LHSs must not consume search budget.
+            // Actual target checkpoints above retain their genuine visited set.
+            done.clear();
+        }
+        restart = Some((bank, done, remaining));
     }
     if let Some((mut restored, done, remaining)) = restart {
         let array = |i: Integral| {
@@ -458,9 +589,88 @@ fn solve<const N: usize>(
     let mut last_saved = std::time::Instant::now();
     let mut completed_expansions = None;
     let mut frontier_cache = FrontierCache::default();
+    if let Some(seed) = seed {
+        admit_identity_seed::<N>(
+            seed,
+            original,
+            dimension,
+            options,
+            context,
+            &mut result,
+            &mut frontier_cache,
+            &mut visited,
+            &mut pending,
+            targets,
+        )?;
+    }
+    let mut provider_calls = 0usize;
+    let mut provider_checked = BTreeSet::new();
     let mut saved_before_exact = BTreeSet::new();
     let search: Result<()> = (|| {
         while !pending.is_empty() {
+            for target in pending.iter().copied().collect::<Vec<_>>() {
+                context.cancellation.check()?;
+                if zero.contains(&target.map(|n| n > 0)) {
+                    continue;
+                }
+                // Existing proof providers may close newly discovered internal leaves.
+                // Unsupported/budget-exhausted requests continue through ordinary reduction.
+                if let Some(provider) = provider
+                    && provider_checked.insert(target)
+                    && provider_calls < provider.max_calls()
+                {
+                    provider_calls += 1;
+                    if let Some(bank) =
+                        provider.provide(original, &Integral(target.to_vec()), context)?
+                    {
+                        context.cancellation.check()?;
+                        let supplied = bank.resolve(original, None, context)?;
+                        if supplied.reduction.rules.len() != 1
+                            || !supplied
+                                .reduction
+                                .rules
+                                .contains_key(&Integral(target.to_vec()))
+                        {
+                            return Err(Error::InvalidInput(
+                                "provider must return exactly the requested identity".into(),
+                            ));
+                        }
+                        validate_identity_order::<N>(
+                            &supplied, original, dimension, options, context,
+                        )?;
+                        for terms in supplied.reduction.rules.values() {
+                            for rhs in terms.keys() {
+                                let powers: [i16; N] =
+                                    rhs.0.as_slice().try_into().map_err(|_| {
+                                        Error::InvalidInput("provider RHS arity".into())
+                                    })?;
+                                if !visited.contains(&powers) {
+                                    pending.insert(powers);
+                                }
+                            }
+                        }
+                        result
+                            .nonzero_conditions
+                            .extend(supplied.reduction.nonzero_conditions);
+                        frontier_cache.insert_rules(&mut result, supplied.reduction.rules);
+                        pending.remove(&target);
+                        // Supplied identities are not expensive target searches.
+                        // The equation itself survives restart in the native codec.
+                        save_if_due(
+                            options,
+                            &stage_key,
+                            &mut result,
+                            &visited,
+                            &pending,
+                            &mut last_saved,
+                        )?;
+                        continue;
+                    }
+                }
+            }
+            if pending.is_empty() {
+                break;
+            }
             if visited.len() + pending.len() > options.max_targets {
                 return Err(Error::Limit(format!(
                     "Laporta RHS closure exceeds max_targets={}",
