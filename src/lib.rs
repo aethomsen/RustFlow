@@ -37,6 +37,7 @@ pub mod epsilon_shearing;
 pub mod error;
 pub mod family;
 mod fixed_series;
+mod series_limits;
 pub mod frobenius;
 #[cfg(feature = "automatic")]
 pub mod ft;

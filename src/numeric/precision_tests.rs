@@ -111,3 +111,122 @@ fn nonfinite_values_keep_general_complex_arithmetic_behavior() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(feature = "automatic")]
+#[test]
+fn gamma_request_measurement_for_equal_mass_two_loop_boundary() -> Result<()> {
+    use crate::*;
+    let family = IntegralFamily {
+        name: "gamma_request_measurement_sunset".into(),
+        loops: vec!["k1".into(), "k2".into()],
+        external: vec![],
+        external_gram: vec![],
+        propagators: vec![
+            Propagator::quadratic(&[1, 0], &[], Atom::one(), &[])?,
+            Propagator::quadratic(&[0, 1], &[], Atom::one(), &[])?,
+            Propagator::quadratic(&[1, 1], &[], Atom::one(), &[])?,
+        ],
+        physical_propagators: 3,
+        epsilon: symbol!("gamma_measurement::eps"),
+        dimension: 4,
+    };
+    let options = FlowOptions {
+        digits: 107,
+        guard_digits: 71,
+        series_order: 300,
+        sampled_reduction: false,
+        mass_mode: MassMode::Propagators(vec![0]),
+        ..Default::default()
+    };
+    let backend = RustRedBackend::default();
+    let context = RunContext::default();
+    let prepared = PreparedFlow::new(
+        &family,
+        &[Integral(vec![1, 1, 1]), Integral(vec![0, 1, 1])],
+        &KinematicPoint::default(),
+        &backend,
+        &options,
+        &context,
+    )?;
+    let boundary = recursive::RecursiveBoundary::new(&backend, &options, &context);
+    GAMMA_VALUES.with(|values| values.borrow_mut().clear());
+    GAMMA_REQUEST_COUNTS.with(|counts| *counts.borrow_mut() = Some(Default::default()));
+    let result = prepared.evaluate(
+        &Rational::from((1, 1_600_000)),
+        &options,
+        &boundary,
+        &context,
+    );
+    let counts = GAMMA_REQUEST_COUNTS.with(|counts| counts.borrow_mut().take().unwrap());
+    let result = result?;
+    assert_eq!(result.len(), 2);
+    let total = counts.values().sum::<usize>();
+    let repeated = counts.values().filter(|count| **count > 1).sum::<usize>();
+    eprintln!(
+        "gamma_request_measurement total={total} unique={} repeated_requests={repeated} counts={counts:?}",
+        counts.len()
+    );
+    assert!(
+        total > counts.len(),
+        "expected recursive boundary reuse is absent"
+    );
+    Ok(())
+}
+
+#[test]
+fn gamma_cache_reuses_high_precision_arguments_and_keeps_precision_profiles_separate() -> Result<()>
+{
+    GAMMA_VALUES.with(|cache| cache.borrow_mut().clear());
+    GAMMA_EVALUATIONS.with(|evaluations| evaluations.set(Some(0)));
+    let p = Precision { bits: 5000 };
+    let argument = p.rational(&Rational::from((3, 2))).re;
+    let first = p.gamma_real(&argument)?;
+    assert_eq!(p.gamma_real(&argument)?, first);
+    assert_eq!(GAMMA_EVALUATIONS.with(|count| count.get()), Some(1));
+    let refined = Precision { bits: 5100 };
+    let higher = refined.gamma_real(&argument)?;
+    assert_eq!(higher.re.prec(), refined.bits);
+    assert_eq!(GAMMA_EVALUATIONS.with(|count| count.get()), Some(2));
+    p.gamma_real(&p.rational(&Rational::from((5, 2))).re)?;
+    assert_eq!(GAMMA_EVALUATIONS.with(|count| count.get()), Some(3));
+    GAMMA_VALUES.with(|cache| cache.borrow_mut().clear());
+    assert_eq!(p.gamma_real(&argument)?, first);
+    assert_eq!(GAMMA_EVALUATIONS.with(|count| count.replace(None)), Some(4));
+    assert!(p.close(&first, &p.round(&higher), 1400));
+    GAMMA_VALUES.with(|cache| cache.borrow_mut().clear());
+    Ok(())
+}
+
+#[test]
+fn gamma_cache_evicts_by_entry_count_and_precision_aware_byte_estimate() {
+    GAMMA_VALUES.with(|cache| cache.borrow_mut().clear());
+    let p = Precision { bits: 80 };
+    for value in 1..=65 {
+        remember_gamma(p.bits, p.real(value), p.i(1));
+    }
+    GAMMA_VALUES.with(|cache| {
+        let cache = cache.borrow();
+        assert_eq!(cache.len(), GAMMA_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.front().unwrap().1, p.real(2));
+    });
+    GAMMA_VALUES.with(|cache| cache.borrow_mut().clear());
+    // Synthetic precision tags exercise the budget without actually reserving
+    // that much memory in the unit test; value correctness is tested above.
+    for value in 1..=40 {
+        remember_gamma(1_000_000, p.real(value), p.i(1));
+    }
+    GAMMA_VALUES.with(|cache| {
+        let cache = cache.borrow();
+        let bytes = cache
+            .iter()
+            .map(|(bits, _, _)| gamma_cache_entry_bytes(*bits))
+            .sum::<u64>();
+        assert!(bytes <= GAMMA_CACHE_MAX_BYTES);
+        assert!(cache.len() < 40);
+        assert!(bytes + gamma_cache_entry_bytes(1_000_000) > GAMMA_CACHE_MAX_BYTES);
+    });
+    let before = GAMMA_VALUES.with(|cache| cache.borrow().len());
+    remember_gamma(u32::MAX, p.real(41), p.i(1));
+    assert_eq!(GAMMA_VALUES.with(|cache| cache.borrow().len()), before);
+    GAMMA_VALUES.with(|cache| cache.borrow_mut().clear());
+}

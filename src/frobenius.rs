@@ -10,6 +10,7 @@ pub(crate) mod exact;
 #[cfg(test)]
 mod projection_tests;
 mod recurrence;
+mod streaming;
 pub use exact::{ExactFrobeniusBasis, ExactFrobeniusLimits};
 
 use crate::{
@@ -59,6 +60,74 @@ fn phase(context: &RunContext, name: impl Into<String>) -> Result<()> {
     context.emit(Progress::Stage { name: name.into() })?;
     // A progress callback can request cancellation before the next exact owner call.
     context.cancellation.check()
+}
+
+#[cfg(test)]
+mod high_order_memory_tests {
+    use super::*;
+
+    #[test]
+    fn exact_log_width_admits_semisimple_high_precision_but_bounds_resonances() -> Result<()> {
+        let x = symbol!("frobenius_memory::x");
+        let prepare = |matrix| {
+            DifferentialSystem {
+                variable: x,
+                matrix,
+            }
+            .prepare_frobenius(&RunContext::default())
+        };
+        let p = Precision::decimal(24_000)?;
+        let simple = prepare(vec![vec![Atom::new(); 4]; 4])?;
+        assert!(
+            simple.estimated_numerical_peak_bytes(p, 27_000, false)
+                < crate::series_limits::MAX_ESTIMATED_BYTES
+        );
+        assert!(
+            simple.estimated_numerical_peak_bytes(p, 27_000, true)
+                > crate::series_limits::MAX_ESTIMATED_BYTES
+        );
+        let mut resonant = vec![vec![Atom::new(); 4]; 4];
+        for (i, row) in resonant.iter_mut().enumerate() {
+            row[i] = Atom::num(i as i64) / Atom::var(x);
+        }
+        let resonant = prepare(resonant)?;
+        assert!(
+            resonant.estimated_numerical_peak_bytes(p, 27_000, false)
+                > crate::series_limits::MAX_ESTIMATED_BYTES
+        );
+        let mut jordan = vec![vec![Atom::new(); 4]; 4];
+        for (i, row) in jordan.iter_mut().enumerate().take(3) {
+            row[i + 1] = Atom::one() / Atom::var(x);
+        }
+        let jordan = prepare(jordan)?;
+        assert!(
+            jordan.estimated_numerical_peak_bytes(p, 27_000, false)
+                > crate::series_limits::MAX_ESTIMATED_BYTES
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_high_degree_source_is_admitted_before_dense_float_conversion() -> Result<()> {
+        let x = symbol!("frobenius_source_memory::x");
+        let prepared = DifferentialSystem {
+            variable: x,
+            matrix: vec![vec![Atom::var(x).pow(60000); 4]; 4],
+        }
+        .prepare_frobenius(&RunContext::default())?;
+        let p = Precision::decimal(24_000)?;
+        // The solution/solver estimate fits, but the dense connection would
+        // exceed the budget. Refuse before allocating those float vectors.
+        assert!(
+            prepared.estimated_numerical_peak_bytes(p, 27_000, false)
+                < crate::series_limits::MAX_ESTIMATED_BYTES
+        );
+        assert!(matches!(
+            prepared.evaluate(p, &Default::default(), 27_000, &RunContext::default()),
+            Err(Error::Limit(_))
+        ));
+        Ok(())
+    }
 }
 
 /// Reject parameter specialization that changes the symbolic resonance pattern.
@@ -393,6 +462,85 @@ impl DifferentialSystem {
 }
 
 impl PreparedFrobenius {
+    fn identity_transformation(&self) -> bool {
+        self.transformation.iter().enumerate().all(|(i, row)| {
+            row.iter().enumerate().all(|(j, entry)| {
+                if i == j {
+                    entry.is_one()
+                } else {
+                    entry.is_zero()
+                }
+            })
+        })
+    }
+
+    fn estimated_numerical_peak_bytes(&self, p: Precision, order: usize, strict: bool) -> u128 {
+        let n = self.source.matrix.len() as u128;
+        // New logarithms can appear at positive integer differences of
+        // indicial exponents. Generic numerical specialization is checked
+        // before recurrence evaluation; strict endpoint mode keeps the full
+        // dimension bound because it does not apply that genericity check.
+        let resonant = strict
+            || self.eigenspaces.iter().enumerate().any(|(i, a)| {
+                self.eigenspaces[..i].iter().any(|b| {
+                    (&a.exponent - &b.exponent)
+                        .together()
+                        .cancel()
+                        .to_string()
+                        .parse::<Integer>()
+                        .is_ok_and(|difference| !difference.is_zero())
+                })
+            });
+        let logs = if resonant {
+            n
+        } else {
+            self.eigenspaces
+                .iter()
+                .flat_map(|space| &space.leading)
+                .map(|column| column.len() as u128)
+                .max()
+                .unwrap_or(1)
+        };
+        let columns = self
+            .eigenspaces
+            .iter()
+            .map(|space| space.leading.len() as u128)
+            .sum::<u128>();
+        // Basis normalization can extend a column by at most 256 powers.
+        let length = (order as u128).saturating_add(257);
+        let coefficients = length
+            .saturating_mul(n)
+            .saturating_mul(columns)
+            .saturating_mul(logs);
+        let matrix = n.saturating_mul(n);
+        let block_factors = self
+            .blocks
+            .iter()
+            .map(|block| (block.len() as u128).saturating_pow(2))
+            .sum::<u128>();
+        let retained_solvers = if self.eigenspaces.iter().any(|space| space.leading.len() > 1) {
+            (order as u128 + 1).saturating_mul(matrix.saturating_add(block_factors))
+        } else {
+            matrix.saturating_add(block_factors)
+        };
+        let resonant_workspace = if resonant {
+            n.saturating_pow(4).saturating_mul(8)
+        } else {
+            matrix.saturating_mul(2)
+        };
+        let recurrence_peak = coefficients
+            .saturating_add(retained_solvers)
+            .saturating_add(resonant_workspace);
+        // Transformation replaces one column at a time and retains its short
+        // exact coefficient list alongside the untransformed columns.
+        let transformation_peak = coefficients
+            .saturating_add(length.saturating_mul(n).saturating_mul(logs))
+            .saturating_add(matrix.saturating_mul(257));
+        recurrence_peak
+            .max(transformation_peak)
+            .saturating_mul(crate::series_limits::complex_bytes(p))
+    }
+
     /// Original exact connection, including expressions before rational cancellation.
     pub fn system(&self) -> &DifferentialSystem {
         &self.source
@@ -453,12 +601,75 @@ impl PreparedFrobenius {
         context: &RunContext,
         strict: bool,
     ) -> Result<FrobeniusBasis> {
+        let (prepared_rows, _) = self.numerical_rows(p, values, order, context, strict, true)?;
+        self.numerical_recurrence(p, values, order, context, strict, &prepared_rows)
+    }
+
+    fn numerical_rows(
+        &self,
+        p: Precision,
+        values: &ahash::HashMap<Atom, C>,
+        order: usize,
+        context: &RunContext,
+        strict: bool,
+        full_basis: bool,
+    ) -> Result<(crate::ode::prepared::PreparedRows, u128)> {
         phase(context, "evaluating the prepared Frobenius recurrence")?;
-        if order > 10_000 {
-            return Err(Error::Limit(
-                "Frobenius expansion exceeds 10000 terms".into(),
-            ));
+        let solution_peak = if full_basis {
+            self.estimated_numerical_peak_bytes(p, order, strict)
+        } else {
+            streaming::StreamingAdmission::estimated_column_bytes(
+                p,
+                self.source.matrix.len(),
+                order,
+                self.eigenspaces
+                    .iter()
+                    .flat_map(|space| &space.leading)
+                    .map(Vec::len)
+                    .max()
+                    .unwrap_or(1),
+                self.identity_transformation(),
+            )
+        };
+        crate::series_limits::admit_bytes(order, solution_peak, "Frobenius expansion")?;
+        // Reuse the finite-row owner for a dense source-storage estimate before
+        // any high-precision coefficient conversion. Sparse high polynomial
+        // powers can otherwise dwarf the retained solution series.
+        let x = Atom::var(self.normal.variable);
+        let rows = self
+            .normal
+            .matrix
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|entry| (entry * &x).together().cancel())
+                    .collect()
+            })
+            .collect::<Vec<Vec<_>>>();
+        let prepared_rows =
+            crate::ode::prepared::PreparedRows::new(self.normal.variable, &rows, context)?;
+        let source_values = prepared_rows
+            .polynomial_storage_values(context)?
+            .saturating_mul(4);
+        let mut condition_values = 0_u128;
+        for condition in &self.nonzero_conditions {
+            context.cancellation.check()?;
+            let length = crate::ode::polynomial_coefficient_terms(condition, self.source.variable)?
+                .iter()
+                .map(|(degree, _)| *degree as u128 + 1)
+                .max()
+                .unwrap_or(1);
+            condition_values = condition_values.max(length);
         }
+        crate::series_limits::admit_bytes(
+            order,
+            solution_peak.saturating_add(
+                source_values
+                    .saturating_add(condition_values)
+                    .saturating_mul(crate::series_limits::complex_bytes(p)),
+            ),
+            "Frobenius expansion with finite source rows",
+        )?;
         for condition in &self.nonzero_conditions {
             context.cancellation.check()?;
             let coefficients = polynomial_coefficients(condition, self.source.variable, p, values)?;
@@ -475,7 +686,10 @@ impl PreparedFrobenius {
         if !strict {
             ensure_generic_exponents(&self.exponents().collect::<Vec<_>>(), p, values)?;
         }
-        self.numerical_recurrence(p, values, order, context, strict)
+        Ok((
+            prepared_rows,
+            source_values.saturating_add(condition_values),
+        ))
     }
 }
 
@@ -587,46 +801,15 @@ impl FrobeniusBasis {
     ) -> Result<Vec<Vec<C>>> {
         self.validate()?;
         let p = self.precision;
-        if !p.finite(z) || *z == p.zero() {
-            return Err(Error::InvalidInput(
-                "evaluate Frobenius series at a nonzero matching point".into(),
-            ));
-        }
-        let log = if winding == 0 {
-            p.log(z)
-        } else {
-            p.add(
-                &p.log(z),
-                &p.scale(&p.log(&p.i(-1)), 2 * i64::from(winding), 1),
-            )
-        };
+        let log = evaluate::logarithm(p, z, winding)?;
         let n = self.columns.len();
         let mut matrix = vec![vec![p.zero(); n]; n];
         for (j, column) in self.columns.iter().enumerate() {
-            let exponent = p.eval(&column.exponent, values)?;
-            let mut power = p.exp(&p.mul(&log, &exponent));
-            if let Some(values) = evaluate::real_column(p, z, &log, &power, column) {
-                for (i, value) in values.into_iter().enumerate() {
-                    matrix[i][j] = value;
-                }
-                continue;
-            }
-            for coeff in &column.coefficients {
-                let mut logpower = p.i(1);
-                for (index, row) in coeff.iter().enumerate() {
-                    let term_power = if index == 0 {
-                        power.clone()
-                    } else {
-                        p.mul(&power, &logpower)
-                    };
-                    for i in 0..n {
-                        matrix[i][j] = p.add(&matrix[i][j], &p.mul(&term_power, &row[i]));
-                    }
-                    if index + 1 < coeff.len() {
-                        logpower = p.mul(&logpower, &log);
-                    }
-                }
-                power = p.mul(&power, z);
+            for (i, value) in evaluate::column_value(p, z, &log, values, column)?
+                .into_iter()
+                .enumerate()
+            {
+                matrix[i][j] = value;
             }
         }
         Ok(matrix)

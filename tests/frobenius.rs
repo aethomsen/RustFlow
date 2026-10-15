@@ -2,6 +2,103 @@ use symbolica::prelude::*;
 use symbolica_amflow::*;
 
 #[test]
+fn polynomial_frobenius_rows_match_exact_expanded_recurrence() -> Result<()> {
+    let p = Precision::decimal(110)?;
+    let x = symbol!("x");
+    let systems = [
+        vec![
+            vec![parse!("99/(100*x)-1/(100*(1-x))"), Atom::new()],
+            vec![Atom::num(1), Atom::new()],
+        ],
+        vec![
+            vec![parse!("-1/(101*x)-102/(101*(1-x))"), Atom::new()],
+            vec![Atom::num(-1), Atom::new()],
+        ],
+        vec![
+            vec![parse!("1/x+1/(1-x)"), parse!("1/x+1/(2-x)")],
+            vec![Atom::new(), parse!("1/x")],
+        ],
+        vec![
+            vec![Atom::new(), Atom::new()],
+            vec![parse!("1/(1-x)"), parse!("1/x")],
+        ],
+        vec![vec![parse!("1/(x*(1+x^2))")]],
+    ];
+    for matrix in systems {
+        let prepared = DifferentialSystem {
+            variable: x,
+            matrix,
+        }
+        .prepare_frobenius(&RunContext::default())?;
+        let numerical = prepared.evaluate(p, &Default::default(), 48, &RunContext::default())?;
+        // The exact coefficient domain retains the rational-entry power-series
+        // recurrence, giving an independent convolution for the same ODE.
+        let reference = prepared
+            .exact_coefficients(
+                48,
+                &frobenius::ExactFrobeniusLimits::default(),
+                &RunContext::default(),
+            )?
+            .numerical(p);
+        for (actual, expected) in numerical.columns.iter().zip(&reference.columns) {
+            assert_eq!(actual.exponent, expected.exponent);
+            assert_eq!(actual.coefficients.len(), expected.coefficients.len());
+            for (actual, expected) in actual.coefficients.iter().zip(&expected.coefficients) {
+                for log in 0..actual.len().max(expected.len()) {
+                    for component in 0..numerical.columns.len() {
+                        let a = actual
+                            .get(log)
+                            .map(|r| r[component].clone())
+                            .unwrap_or_else(|| p.zero());
+                        let b = expected
+                            .get(log)
+                            .map(|r| r[component].clone())
+                            .unwrap_or_else(|| p.zero());
+                        assert!(
+                            p.close(&a, &b, 85),
+                            "coefficient mismatch at log {log}, component {component}"
+                        );
+                    }
+                }
+            }
+        }
+        let point = p.rational(&Rational::from((1, 5)));
+        let actual = numerical.evaluate(&point, &Default::default())?;
+        let expected = reference.evaluate(&point, &Default::default())?;
+        for (a, b) in actual.iter().flatten().zip(expected.iter().flatten()) {
+            assert!(p.close(a, b, 85));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn extended_frobenius_order_obeys_allocation_admission() -> Result<()> {
+    let prepared = DifferentialSystem {
+        variable: symbol!("x"),
+        matrix: vec![vec![parse!("1/x")]],
+    }
+    .prepare_frobenius(&RunContext::default())?;
+    let p = Precision::decimal(40)?;
+    let result = prepared.evaluate(p, &Default::default(), 10_001, &RunContext::default())?;
+    assert_eq!(result.columns[0].coefficients.len(), 10_002);
+    assert!(matches!(
+        prepared.evaluate(p, &Default::default(), 200_001, &RunContext::default()),
+        Err(Error::Limit(_))
+    ));
+    assert!(matches!(
+        prepared.evaluate(
+            Precision { bits: u32::MAX },
+            &Default::default(),
+            10_001,
+            &RunContext::default()
+        ),
+        Err(Error::Limit(_))
+    ));
+    Ok(())
+}
+
+#[test]
 fn sparse_high_rank_logarithmic_recurrence_matches_matrix_exponential() {
     let n = 9;
     let x = symbol!("sparse_log_x");

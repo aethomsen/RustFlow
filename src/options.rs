@@ -302,9 +302,12 @@ impl FlowOptions {
         if self.digits.checked_add(self.guard_digits).is_none() {
             return Err(Error::InvalidInput("working precision overflow".into()));
         }
-        if self.series_order > 10000 || self.max_precision_attempts > 16 || self.workers > 256 {
+        if self.series_order > crate::series_limits::MAX_ORDER
+            || self.max_precision_attempts > 16
+            || self.workers > 256
+        {
             return Err(Error::Limit(
-                "limits are 10000 series terms, 16 refinement attempts, and 256 workers".into(),
+                "limits are 200000 series terms, 16 refinement attempts, and 256 workers; numerical series allocations are admitted separately".into(),
             ));
         }
         Ok(())

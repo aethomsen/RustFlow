@@ -164,9 +164,9 @@ pub fn evaluate_series(
         ));
     }
     let order = exact.absolute_order();
-    if !order.is_integer() || order <= 0 || order > 10001 {
+    if !order.is_integer() || order <= 0 || order > (crate::series_limits::MAX_ORDER + 1) as i64 {
         return Err(Error::Unsupported(
-            "numeric coefficient chart requires a positive integer series order at most 10001"
+            "numeric coefficient chart requires a positive integer series order at most 200001"
                 .into(),
         ));
     }
@@ -197,11 +197,20 @@ pub fn evaluate_series(
 /// powers are known, even when high coefficients vanish. No f64 conversion or
 /// source-precision promotion is used as accuracy evidence.
 pub fn fixed_series(p: Precision, variable: Symbol, coefficients: &[C]) -> Result<NumericSeries> {
-    if coefficients.is_empty() || coefficients.len() > 10001 || p.bits < 2 {
+    if coefficients.is_empty()
+        || coefficients.len() > crate::series_limits::MAX_ORDER + 1
+        || p.bits < 2
+    {
         return Err(Error::InvalidInput(
-            "fixed series requires 1..=10001 retained coefficients and valid precision".into(),
+            "fixed series requires 1..=200001 retained coefficients and valid precision".into(),
         ));
     }
+    crate::series_limits::admit_complex(
+        p,
+        coefficients.len() - 1,
+        (coefficients.len() as u128).saturating_mul(8),
+        "native fixed series construction",
+    )?;
     if coefficients.iter().any(|a| !p.finite(a)) {
         return Err(Error::Numerical(
             "nonfinite fixed-series coefficient".into(),
@@ -250,12 +259,18 @@ pub fn fixed_series(p: Precision, variable: Symbol, coefficients: &[C]) -> Resul
 /// Read only known Taylor coefficients. A request crossing the series remainder
 /// is an accuracy error rather than an invented string of zero coefficients.
 pub fn coefficients(series: &NumericSeries, length: usize) -> Result<Vec<C>> {
-    if length > 10001 {
+    if length > crate::series_limits::MAX_ORDER + 1 {
         return Err(Error::Limit(
-            "numeric series extraction exceeds 10001 coefficients".into(),
+            "numeric series extraction exceeds 200001 coefficients".into(),
         ));
     }
     let p = series.get_field().precision();
+    crate::series_limits::admit_complex(
+        p,
+        length.saturating_sub(1),
+        (length as u128).saturating_mul(2),
+        "native fixed series extraction",
+    )?;
     (0..length)
         .map(|index| {
             let coefficient = series
@@ -440,5 +455,21 @@ mod tests {
         assert!(fixed_series(Precision { bits: 1 }, x, &[p.i(1)]).is_err());
         assert!(fixed_series(p, x, &[p.parse("inf", "0").unwrap()]).is_err());
         assert!(fixed_series(p, x, &[]).is_err());
+    }
+
+    #[test]
+    fn extended_native_series_preserves_known_high_coefficient_and_remainder() {
+        let p = Precision::decimal(40).unwrap();
+        let x = symbol!("extended_native_series::x");
+        let mut input = vec![p.zero(); 10_002];
+        input[0] = p.i(1);
+        input[10_001] = p.i(3);
+        let series = fixed_series(p, x, &input).unwrap();
+        assert_eq!(coefficients(&series, input.len()).unwrap(), input);
+        assert!(coefficients(&series, input.len() + 1).is_err());
+        assert!(matches!(
+            fixed_series(Precision { bits: u32::MAX }, x, &input),
+            Err(Error::Limit(_))
+        ));
     }
 }

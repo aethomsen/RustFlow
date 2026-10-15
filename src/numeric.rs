@@ -20,6 +20,40 @@ thread_local! {
     };
 }
 
+const GAMMA_CACHE_MAX_ENTRIES: usize = 64;
+const GAMMA_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+fn gamma_cache_entry_bytes(bits: u32) -> u64 {
+    // One argument and the real/imaginary components of the value, plus
+    // conservative float/container bookkeeping. The key stores working bits.
+    3 * (u64::from(bits).div_ceil(8) + 64)
+}
+
+fn remember_gamma(bits: u32, argument: Float, value: ComplexFloat) {
+    let bytes = gamma_cache_entry_bytes(bits);
+    if bytes > GAMMA_CACHE_MAX_BYTES {
+        return;
+    }
+    GAMMA_VALUES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let mut retained = cache
+            .iter()
+            .map(|(bits, _, _)| gamma_cache_entry_bytes(*bits))
+            .sum::<u64>();
+        while cache.len() >= GAMMA_CACHE_MAX_ENTRIES || retained + bytes > GAMMA_CACHE_MAX_BYTES {
+            let (bits, _, _) = cache.pop_front().unwrap();
+            retained -= gamma_cache_entry_bytes(bits);
+        }
+        cache.push_back((bits, argument, value));
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    static GAMMA_REQUEST_COUNTS: RefCell<Option<std::collections::HashMap<(u32, Float), usize>>> = const { RefCell::new(None) };
+    static GAMMA_EVALUATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Precision {
     pub bits: u32,
@@ -219,20 +253,30 @@ impl Precision {
             return Err(Error::Numerical("nonfinite gamma argument".into()));
         }
         let rounded = Float::with_val(self.bits, a.as_raw());
-        if self.bits <= 4096
-            && let Some(value) = GAMMA_VALUES.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                let index = cache
-                    .iter()
-                    .position(|(bits, argument, _)| *bits == self.bits && argument == &rounded)?;
-                let entry = cache.remove(index).unwrap();
-                let value = entry.2.clone();
-                cache.push_back(entry);
-                Some(value)
-            })
-        {
+        #[cfg(test)]
+        GAMMA_REQUEST_COUNTS.with(|counts| {
+            if let Some(counts) = counts.borrow_mut().as_mut() {
+                *counts.entry((self.bits, rounded.clone())).or_default() += 1;
+            }
+        });
+        if let Some(value) = GAMMA_VALUES.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let index = cache
+                .iter()
+                .position(|(bits, argument, _)| *bits == self.bits && argument == &rounded)?;
+            let entry = cache.remove(index).unwrap();
+            let value = entry.2.clone();
+            cache.push_back(entry);
+            Some(value)
+        }) {
             return Ok(value);
         }
+        #[cfg(test)]
+        GAMMA_EVALUATIONS.with(|evaluations| {
+            if let Some(count) = evaluations.get() {
+                evaluations.set(Some(count + 1));
+            }
+        });
         let argument = Atom::var(symbol!("symbolica_amflow::gamma_argument"));
         let expression = symbolica::transcendental::gamma().call(&argument);
         let parameters = ahash::HashMap::from_iter([(argument, rounded.clone())]);
@@ -245,15 +289,7 @@ impl Precision {
             ));
         }
         let result = Complex::new(Float::with_val(self.bits, value.as_raw()), self.real(0));
-        if self.bits <= 4096 {
-            GAMMA_VALUES.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                if cache.len() == 64 {
-                    cache.pop_front();
-                }
-                cache.push_back((self.bits, rounded, result.clone()));
-            });
-        }
+        remember_gamma(self.bits, rounded, result.clone());
         Ok(result)
     }
     pub fn tolerance(&self, digits: u32) -> Float {

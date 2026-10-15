@@ -323,6 +323,9 @@ impl PreparedFlow {
                     .fold(p.zero(), |s, (v, c)| p.add(&s, &p.mul(v, c)))
             })
             .collect();
+        // A long infinity basis is no longer needed once its initial values
+        // have been formed. Release it before allocating Taylor chart buffers.
+        drop(infinity);
         let minimum = compiled
             .poles
             .iter()
@@ -920,60 +923,47 @@ pub(crate) fn fit_samples_refined_leading(
             "last epsilon power precedes leading pole bound".into(),
         ));
     }
-    let width = (i64::from(last) - i64::from(leading) + 1) as usize;
-    // A smaller regulator radius and balanced nodes reduce the extrapolation
-    // order and conditioning cost. This is an initial proposal only: the
-    // independent higher-order, smaller-radius fit still admits every result.
-    let count = width + (options.digits as usize).div_ceil(3) + 2;
-    // Use complete +/- pairs. An unpaired positive node adds a flow solve
-    // without the even/odd cancellation of a balanced interpolation grid.
-    let count = count + count % 2;
-    if count > 10000 {
-        return Err(Error::Limit(
-            "epsilon reconstruction exceeds 10000 samples".into(),
-        ));
-    }
     let mut previous: Option<Vec<LaurentExpansion>> = None;
-    // Reserve digits for extracting positive powers from a pole-subtracted
-    // polynomial at |epsilon| <= 1e-3. Starting an underresolved Vandermonde
-    // fit wastes a complete AMF sample set before its first accuracy check.
-    let fit_guard = u32::try_from(width)
-        .ok()
-        .and_then(|n| n.checked_sub(1))
-        .and_then(|n| n.checked_mul(3))
-        .and_then(|n| n.checked_add(8))
-        .ok_or_else(|| Error::Limit("epsilon fit precision overflow".into()))?;
-    let mut working_digits = options
-        .digits
-        .checked_add(options.guard_digits.max(fit_guard))
-        .ok_or_else(|| Error::Limit("epsilon fit precision overflow".into()))?;
+    let mut retry_digits = 0;
     for attempt in 0..=options.max_precision_attempts {
+        let profile = epsilon::EpsilonFitProfile::new(
+            options.digits,
+            options.guard_digits,
+            leading,
+            last,
+            attempt,
+        )?;
+        let current_digits = profile.working_digits.max(retry_digits);
         let mut refined = options.clone();
-        refined.guard_digits = working_digits - options.digits;
+        refined.guard_digits = current_digits - options.digits;
         refined.series_order += attempt * 16;
         refined.refine_rational_order(attempt);
         refined.validate()?;
-        let samples = epsilon::symmetric_epsilon_samples(
-            count + attempt * 4,
-            1000 * (1_i64
-                .checked_shl(attempt as u32)
-                .ok_or_else(|| Error::Limit("too many precision attempts".into()))?),
-        )?;
+        let samples = profile.samples;
         let p = Precision::decimal(refined.digits + refined.guard_digits)?;
-        let current_digits = working_digits;
-        // Nodes are normalized to the unit interval before solving the fit;
-        // only the requested coefficient range loses powers of the regulator
-        // radius. An independent twelve-digit precision increase is sufficient
-        // as an initial refinement. Failed stabilization continues to refine,
-        // and arithmetic precision failures retain the larger retry increment.
-        working_digits = current_digits
-            .checked_add(12)
+        // Numerical refinement is independent even after a precision hint has
+        // overtaken the profile's baseline: increase the arithmetic precision,
+        // shrink the exact radius and add nodes and transport terms.
+        retry_digits = current_digits
+            .checked_add(32)
             .ok_or_else(|| Error::Limit("epsilon fit precision overflow".into()))?;
-        let values = match evaluate(&samples, &refined) {
+        let values = match evaluate(&samples, &refined).and_then(|values| {
+            if values.len() != samples.len() || values.iter().any(|row| row.len() != targets) {
+                return Err(Error::InvalidInput(
+                    "epsilon evaluator returned inconsistent sample dimensions".into(),
+                ));
+            }
+            if values.iter().flatten().any(|value| !p.finite(value)) {
+                return Err(Error::Numerical(
+                    "nonfinite automatic epsilon sample".into(),
+                ));
+            }
+            Ok(values)
+        }) {
             Err(Error::InsufficientPrecision { minimum_bits, .. })
                 if attempt < options.max_precision_attempts =>
             {
-                working_digits = Precision::refinement_digits(current_digits, minimum_bits)?;
+                retry_digits = Precision::refinement_digits(current_digits, minimum_bits)?;
                 previous = None;
                 continue;
             }
@@ -997,6 +987,13 @@ pub(crate) fn fit_samples_refined_leading(
             })
             .collect::<Result<Vec<_>>>();
         let mut fits = match fits {
+            Err(Error::InsufficientPrecision { minimum_bits, .. })
+                if attempt < options.max_precision_attempts =>
+            {
+                retry_digits = Precision::refinement_digits(current_digits, minimum_bits)?;
+                previous = None;
+                continue;
+            }
             Err(Error::Accuracy(_) | Error::Numerical(_))
                 if attempt < options.max_precision_attempts =>
             {
@@ -1080,7 +1077,7 @@ mod tests {
         })?;
         assert_eq!(fits[0].verified_digits, Some(20));
         assert!(fits[0].validation_samples > 0);
-        assert!(calls.borrow().iter().sum::<usize>() < 62);
+        assert_eq!(*calls.borrow(), vec![32, 36]);
         let p = Precision::decimal(100)?;
         for power in -4..=2 {
             assert!(p.close(&fits[0].coefficients[&power], &p.i(1), 20));

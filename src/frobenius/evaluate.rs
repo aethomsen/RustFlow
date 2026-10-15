@@ -1,7 +1,59 @@
 //! Real Horner evaluation on positive matching coordinates in the unit disk.
-use super::{C, FrobeniusColumn, Precision};
+use super::{C, Error, FrobeniusColumn, Precision, Result};
 use symbolica::domains::float::{Float, RoundingDirection::Nearest};
 use symbolica::prelude::*;
+
+pub(super) fn logarithm(p: Precision, z: &C, winding: i32) -> Result<C> {
+    if !p.finite(z) || *z == p.zero() {
+        return Err(Error::InvalidInput(
+            "evaluate Frobenius series at a nonzero matching point".into(),
+        ));
+    }
+    Ok(if winding == 0 {
+        p.log(z)
+    } else {
+        p.add(
+            &p.log(z),
+            &p.scale(&p.log(&p.i(-1)), 2 * i64::from(winding), 1),
+        )
+    })
+}
+
+/// Shared evaluator for a validated column. Both full-basis and streamed
+/// evaluation use the same power/log branches and real Horner specialization.
+pub(super) fn column_value(
+    p: Precision,
+    z: &C,
+    log: &C,
+    parameters: &ahash::HashMap<Atom, C>,
+    column: &FrobeniusColumn,
+) -> Result<Vec<C>> {
+    let exponent = p.eval(&column.exponent, parameters)?;
+    let mut power = p.exp(&p.mul(log, &exponent));
+    if let Some(values) = real_column(p, z, log, &power, column) {
+        return Ok(values);
+    }
+    let n = column.coefficients[0][0].len();
+    let mut values = vec![p.zero(); n];
+    for coeff in &column.coefficients {
+        let mut logpower = p.i(1);
+        for (index, row) in coeff.iter().enumerate() {
+            let term_power = if index == 0 {
+                power.clone()
+            } else {
+                p.mul(&power, &logpower)
+            };
+            for i in 0..n {
+                values[i] = p.add(&values[i], &p.mul(&term_power, &row[i]));
+            }
+            if index + 1 < coeff.len() {
+                logpower = p.mul(&logpower, log);
+            }
+        }
+        power = p.mul(&power, z);
+    }
+    Ok(values)
+}
 
 pub(super) fn real_column(
     p: Precision,

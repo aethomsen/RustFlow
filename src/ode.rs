@@ -448,7 +448,13 @@ impl CompiledSystem {
     /// Retain declared nonzero polynomial domains, even when the differential
     /// matrix is regular there. Roots restrict contour planning and Taylor
     /// radii; the exact polynomials survive local-coordinate recompilation.
-    pub(crate) fn exclude_polynomials(&mut self, guards: &[Atom]) -> Result<()> {
+    ///
+    /// Supply the exact polynomial factors before canceling their assumptions
+    /// from a reduction or change of basis. Other symbols must already have
+    /// values in this compiled system. An identically zero or numerically
+    /// unresolved guard is rejected. This preserves the supplied domain; it
+    /// does not recover discarded factors or choose a physical branch.
+    pub fn exclude_polynomials(&mut self, guards: &[Atom]) -> Result<()> {
         if guards.is_empty() {
             return Ok(());
         }
@@ -512,6 +518,31 @@ impl CompiledSystem {
         self.taylor_channels(center, values, order, 1)
     }
 
+    pub(crate) fn taylor_workspace_bytes(&self, order: usize, channels: usize) -> u128 {
+        let degree = self
+            .polynomial_rows
+            .iter()
+            .flat_map(|row| {
+                std::iter::once(row.denominator.len()).chain(
+                    row.entries
+                        .iter()
+                        .map(|(_, coefficients)| coefficients.len()),
+                )
+            })
+            .max()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        // y/y', directed residual polynomials and their derivatives, temporary
+        // native polynomial products, and conditioning balls coexist during
+        // chart construction. Keep the full source polynomial degree: sparse
+        // high powers must not bypass either the defect or memory checks.
+        (order as u128 + degree as u128 + 2)
+            .saturating_mul(self.dimension() as u128)
+            .saturating_mul(channels as u128)
+            .saturating_mul(12)
+            .saturating_mul(crate::series_limits::complex_bytes(self.p))
+    }
+
     /// Shared finite-polynomial recurrence for ordinary and epsilon-series
     /// transport. A column `shift * n + component` couples channel `e` to
     /// `e - shift`; ordinary transport has one channel and zero shifts.
@@ -532,6 +563,11 @@ impl CompiledSystem {
         if channels == 0 || values.len() != size {
             return Err(Error::InvalidInput("boundary channel dimensions".into()));
         }
+        crate::series_limits::admit_bytes(
+            order,
+            self.taylor_workspace_bytes(order, channels),
+            "rational Taylor chart",
+        )?;
         let zero = p.zero();
         // Translate only the finite polynomial degrees needed at this order;
         // no rational matrix entry is expanded into an order-long power series.
@@ -682,6 +718,13 @@ pub(crate) trait SeriesSystem {
     fn precision(&self) -> Precision;
     fn dimension(&self) -> usize;
     fn poles(&self) -> &[C];
+    /// Owners with a bounded high-order chart implementation provide its
+    /// conservative workspace estimate. Other owners retain the former cap.
+    fn extended_order_workspace_bytes(&self, _order: usize) -> Result<u128> {
+        Err(Error::Unsupported(
+            "series orders above 10000 require an allocation estimate from this chart owner".into(),
+        ))
+    }
     fn local_chart(
         &self,
         center: &C,
@@ -783,6 +826,9 @@ impl SeriesSystem for CompiledSystem {
     }
     fn poles(&self) -> &[C] {
         &self.poles
+    }
+    fn extended_order_workspace_bytes(&self, order: usize) -> Result<u128> {
+        Ok(self.taylor_workspace_bytes(order, 1))
     }
     fn local_chart(
         &self,
@@ -1222,6 +1268,30 @@ pub(crate) fn transport_series_observed<S: SeriesSystem>(
     options.validate()?;
     context.cancellation.check()?;
     let p = system.precision();
+    let extended_workspace = if options.series_order > crate::series_limits::LEGACY_MAX_ORDER {
+        Some(system.extended_order_workspace_bytes(options.series_order)?)
+    } else {
+        None
+    };
+    let mut retained_bytes = saved.as_ref().map_or(0, |segments| {
+        segments
+            .iter()
+            .map(|segment| {
+                (segment.coefficients.iter().map(Vec::len).sum::<usize>() as u128).saturating_mul(
+                    crate::series_limits::complex_bytes(Precision {
+                        bits: segment.working_bits,
+                    }),
+                )
+            })
+            .fold(0_u128, u128::saturating_add)
+    });
+    if let Some(workspace) = extended_workspace {
+        crate::series_limits::admit_bytes(
+            options.series_order,
+            workspace.saturating_add(retained_bytes),
+            "Taylor transport with retained segments",
+        )?;
+    }
     if boundary.values.len() != system.dimension()
         || !p.finite(&boundary.point)
         || boundary.values.iter().any(|v| !p.finite(v))
@@ -1240,6 +1310,13 @@ pub(crate) fn transport_series_observed<S: SeriesSystem>(
     for target in waypoints {
         let mut previous_step: Option<C> = None;
         while center != *target {
+            if let Some(workspace) = extended_workspace {
+                crate::series_limits::admit_bytes(
+                    options.series_order,
+                    workspace.saturating_add(retained_bytes),
+                    "Taylor transport with retained segments",
+                )?;
+            }
             context.emit(Progress::Step {
                 index: diagnostics.steps,
             })?;
@@ -1453,6 +1530,10 @@ pub(crate) fn transport_series_observed<S: SeriesSystem>(
             state = next_state;
             observe(&chart, &state);
             if let Some(segments) = saved.as_deref_mut() {
+                retained_bytes = retained_bytes.saturating_add(
+                    (coefficients.iter().map(Vec::len).sum::<usize>() as u128)
+                        .saturating_mul(crate::series_limits::complex_bytes(p)),
+                );
                 segments.push(TaylorSegment {
                     center: center.clone(),
                     end: next.clone(),
@@ -1832,3 +1913,7 @@ mod exclusion_tests;
 #[cfg(test)]
 #[path = "ode/prepared_tests.rs"]
 mod prepared_tests;
+
+#[cfg(test)]
+#[path = "ode/high_order_tests.rs"]
+mod high_order_tests;

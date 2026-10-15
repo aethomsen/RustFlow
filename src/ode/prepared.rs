@@ -27,6 +27,31 @@ pub(crate) struct PreparedRows {
 }
 
 impl PreparedRows {
+    /// Number of dense coefficient slots allocated by rows-only specialization.
+    /// Count exact sparse polynomial degrees before allocating numerical arrays.
+    pub(crate) fn polynomial_storage_values(&self, context: &RunContext) -> Result<u128> {
+        let mut count = 0_u128;
+        for row in &self.rows {
+            for expression in std::iter::once(&row.denominator)
+                .chain(row.cleared.iter().map(|(_, expression)| expression))
+                .chain(
+                    row.denominator_factors
+                        .iter()
+                        .map(|(expression, _)| expression),
+                )
+            {
+                context.cancellation.check()?;
+                let length = polynomial_coefficient_terms(expression, self.variable)?
+                    .iter()
+                    .map(|(degree, _)| *degree as u128 + 1)
+                    .max()
+                    .unwrap_or(1);
+                count = count.saturating_add(length);
+            }
+        }
+        Ok(count)
+    }
+
     pub(crate) fn new(variable: Symbol, rows: &[Vec<Atom>], context: &RunContext) -> Result<Self> {
         context.cancellation.check()?;
         validate_ode_variable(variable)?;
@@ -161,46 +186,10 @@ impl PreparedRows {
                     denominator,
                 });
             }
-            let denominator = polynomial_coefficients(&row.denominator, variable, p, values)?;
-            let exact_denominator = exact_values.polynomial(&row.denominator, variable)?;
-            let exact_denominator_factors = row
-                .denominator_factors
-                .iter()
-                .map(|(factor, multiplicity)| {
-                    context.cancellation.check()?;
-                    Ok((exact_values.polynomial(factor, variable)?, *multiplicity))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            if exact_denominator_factors
-                .iter()
-                .any(|(factor, _)| factor.iter().all(SingleFloat::is_zero))
-            {
-                return Err(Error::Numerical(
-                    "identically zero specialized denominator factor".into(),
-                ));
-            }
-            let mut exact_entries = Vec::new();
-            let mut entries = Vec::new();
-            for (column, cleared) in &row.cleared {
-                context.cancellation.check()?;
-                let coefficients = polynomial_coefficients(cleared, variable, p, values)?;
-                let exact_coefficients = exact_values.polynomial(cleared, variable)?;
-                if exact_coefficients.iter().any(|c| !c.is_zero()) {
-                    exact_entries.push((*column, exact_coefficients));
-                }
-                if coefficients.iter().any(|c| *c != p.zero()) {
-                    entries.push((*column, coefficients));
-                }
-            }
-            polynomial_rows.push(PolynomialRow {
-                denominator,
-                entries,
-            });
-            exact_source_rows.push(source::ExactPolynomialRow {
-                denominator: exact_denominator,
-                denominator_factors: exact_denominator_factors,
-                entries: exact_entries,
-            });
+            let (polynomial, exact_source) =
+                self.compile_polynomial_row(row, p, values, &exact_values, context)?;
+            polynomial_rows.push(polynomial);
+            exact_source_rows.push(exact_source);
             matrix.push(out);
         }
         context.cancellation.check()?;
@@ -217,5 +206,137 @@ impl PreparedRows {
             polynomial_rows,
             exact_source_rows,
         })
+    }
+
+    /// Specialize the shared denominator-cleared rows without finding poles.
+    /// Frobenius recurrences need these finite polynomials, but do not need a
+    /// numerical root solve for each off-center denominator factor. In
+    /// particular, specialization may create repeated off-center roots without
+    /// obstructing a local series at the chosen regular-singular point.
+    pub(crate) fn compile_polynomial_rows(
+        &self,
+        p: Precision,
+        values: &ahash::HashMap<Atom, C>,
+        context: &RunContext,
+    ) -> Result<Vec<PolynomialRow>> {
+        context.cancellation.check()?;
+        let exact_values = source::ExactSpecialization::new(p, values)?;
+        self.rows
+            .iter()
+            .map(|row| {
+                context.cancellation.check()?;
+                // Preserve the entry-wise numerical domain checks made by the
+                // full compiler, in addition to the shared exact factor checks.
+                for rational in &row.matrix {
+                    context.cancellation.check()?;
+                    let denominator =
+                        polynomial_coefficients(&rational.denominator, self.variable, p, values)?;
+                    if denominator.iter().all(|v| *v == p.zero()) {
+                        return Err(Error::Numerical(
+                            "identically zero specialized denominator".into(),
+                        ));
+                    }
+                }
+                self.compile_polynomial_row(row, p, values, &exact_values, context)
+                    .map(|(polynomial, _)| polynomial)
+            })
+            .collect()
+    }
+
+    /// One coefficient-extraction owner for full transport and rows-only
+    /// consumers. Exact stored-dyadic source values and sparse-zero decisions
+    /// remain identical to the full compiler's original operation order.
+    fn compile_polynomial_row(
+        &self,
+        row: &PreparedRow,
+        p: Precision,
+        values: &ahash::HashMap<Atom, C>,
+        exact_values: &source::ExactSpecialization,
+        context: &RunContext,
+    ) -> Result<(PolynomialRow, source::ExactPolynomialRow)> {
+        let variable = self.variable;
+        let denominator = polynomial_coefficients(&row.denominator, variable, p, values)?;
+        let exact_denominator = exact_values.polynomial(&row.denominator, variable)?;
+        let exact_denominator_factors = row
+            .denominator_factors
+            .iter()
+            .map(|(factor, multiplicity)| {
+                context.cancellation.check()?;
+                Ok((exact_values.polynomial(factor, variable)?, *multiplicity))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if exact_denominator_factors
+            .iter()
+            .any(|(factor, _)| factor.iter().all(SingleFloat::is_zero))
+        {
+            return Err(Error::Numerical(
+                "identically zero specialized denominator factor".into(),
+            ));
+        }
+        let mut exact_entries = Vec::new();
+        let mut entries = Vec::new();
+        for (column, cleared) in &row.cleared {
+            context.cancellation.check()?;
+            let coefficients = polynomial_coefficients(cleared, variable, p, values)?;
+            let exact_coefficients = exact_values.polynomial(cleared, variable)?;
+            if exact_coefficients.iter().any(|c| !c.is_zero()) {
+                exact_entries.push((*column, exact_coefficients));
+            }
+            if coefficients.iter().any(|c| *c != p.zero()) {
+                entries.push((*column, coefficients));
+            }
+        }
+        Ok((
+            PolynomialRow {
+                denominator,
+                entries,
+            },
+            source::ExactPolynomialRow {
+                denominator: exact_denominator,
+                denominator_factors: exact_denominator_factors,
+                entries: exact_entries,
+            },
+        ))
+    }
+}
+
+#[cfg(test)]
+mod polynomial_rows_tests {
+    use super::*;
+
+    #[test]
+    fn rows_only_specialization_matches_full_compiler() -> Result<()> {
+        let context = RunContext::default();
+        let p = Precision::decimal(80)?;
+        let rows = PreparedRows::new(
+            symbol!("x"),
+            &[vec![parse!("1/(1-x)"), parse!("x/(2-x)")]],
+            &context,
+        )?;
+        let ordinary = rows.compile(p, &Default::default(), &context)?;
+        let finite = rows.compile_polynomial_rows(p, &Default::default(), &context)?;
+        for (actual, expected) in finite.iter().zip(&ordinary.polynomial_rows) {
+            assert_eq!(actual.denominator, expected.denominator);
+            assert_eq!(actual.entries, expected.entries);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rows_only_accepts_specialized_repeated_roots_and_keeps_domain_checks() -> Result<()> {
+        let context = RunContext::default();
+        let p = Precision::decimal(80)?;
+        let values = ahash::HashMap::from_iter([(parse!("a"), p.zero())]);
+        let rows = PreparedRows::new(symbol!("x"), &[vec![parse!("1/((1-x)^2+a)")]], &context)?;
+        let finite = rows.compile_polynomial_rows(p, &values, &context)?;
+        assert_eq!(finite[0].denominator, vec![p.i(1), p.i(-2), p.i(1)]);
+        let undefined = PreparedRows::new(symbol!("x"), &[vec![parse!("1/(a*(1-x))")]], &context)?;
+        assert!(matches!(
+            undefined.compile_polynomial_rows(p, &values, &context),
+            Err(Error::Numerical(_))
+        ));
+        context.cancellation.cancel();
+        assert!(rows.compile_polynomial_rows(p, &values, &context).is_err());
+        Ok(())
     }
 }

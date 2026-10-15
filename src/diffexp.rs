@@ -516,6 +516,9 @@ impl SeriesSystem for CompiledEpsilonSystem {
     fn poles(&self) -> &[C] {
         self.poles()
     }
+    fn extended_order_workspace_bytes(&self, order: usize) -> Result<u128> {
+        Ok(self.rows.taylor_workspace_bytes(order, self.count))
+    }
 
     fn local_chart(
         &self,

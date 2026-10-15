@@ -6,6 +6,13 @@ pub(crate) struct RecurrenceColumn<S> {
     pub(crate) coefficients: Vec<Vec<Vec<S>>>,
 }
 
+/// Finite polynomial rows for x D_i(x) y'_i = sum_j P_ij(x) y_j.
+/// The constant coefficient of each D_i is normalized to one.
+pub(super) struct RecurrenceRow<S> {
+    denominator: Vec<S>,
+    entries: Vec<(usize, Vec<S>)>,
+}
+
 pub(super) trait CoefficientDomain {
     type Scalar: Clone + PartialEq;
     type Solver;
@@ -38,10 +45,20 @@ pub(super) trait CoefficientDomain {
         rhs: Vec<Self::Scalar>,
         context: &RunContext,
     ) -> Result<Vec<Self::Scalar>>;
+    fn polynomial_rows(
+        &self,
+        _system: &DifferentialSystem,
+        _context: &RunContext,
+    ) -> Result<Option<Vec<RecurrenceRow<Self::Scalar>>>> {
+        Ok(None)
+    }
     fn preflight(&self, _dimension: usize, _order: usize) -> Result<()> {
         Ok(())
     }
     fn preflight_matrix(&self, _dimension: usize) -> Result<()> {
+        Ok(())
+    }
+    fn preflight_column(&self, _dimension: usize, _order: usize, _logs: usize) -> Result<()> {
         Ok(())
     }
     fn preflight_series(&self, _expression: &Atom, _variable: Symbol, _order: usize) -> Result<()> {
@@ -59,12 +76,26 @@ struct NumericalDomain<'a> {
     p: Precision,
     values: &'a ahash::HashMap<Atom, C>,
     strict: bool,
+    prepared_rows: &'a crate::ode::prepared::PreparedRows,
+    streaming: Option<&'a super::streaming::StreamingAdmission>,
 }
 impl CoefficientDomain for NumericalDomain<'_> {
     type Scalar = C;
     type Solver = crate::numeric::BlockSolve;
     fn zero(&self) -> C {
         self.p.zero()
+    }
+    fn preflight_column(&self, dimension: usize, order: usize, logs: usize) -> Result<()> {
+        if let Some(admission) = self.streaming {
+            admission.column(dimension, order, logs)?;
+        }
+        Ok(())
+    }
+    fn preflight_matrix(&self, dimension: usize) -> Result<()> {
+        if let Some(admission) = self.streaming {
+            admission.matrix(dimension)?;
+        }
+        Ok(())
     }
     fn integer(&self, value: i64) -> C {
         self.p.i(value)
@@ -135,6 +166,46 @@ impl CoefficientDomain for NumericalDomain<'_> {
     ) -> Result<Vec<C>> {
         solve_any(self.p, matrix, rhs, context, self.strict)
     }
+    fn polynomial_rows(
+        &self,
+        _system: &DifferentialSystem,
+        context: &RunContext,
+    ) -> Result<Option<Vec<RecurrenceRow<C>>>> {
+        // Reuse the ordinary Taylor solver's exact row-denominator owner.
+        // Expanding x M(x) into a long geometric series would make the
+        // Frobenius convolution quadratic in the requested expansion order.
+        let rows = self
+            .prepared_rows
+            .compile_polynomial_rows(self.p, self.values, context)?
+            .into_iter()
+            .map(|row| {
+                let divisor = &row.denominator[0];
+                if divisor == &self.p.zero() {
+                    return Err(Error::Numerical(
+                        "Frobenius row denominator vanishes at expansion center".into(),
+                    ));
+                }
+                Ok(RecurrenceRow {
+                    denominator: row
+                        .denominator
+                        .iter()
+                        .map(|v| self.p.div(v, divisor))
+                        .collect(),
+                    entries: row
+                        .entries
+                        .into_iter()
+                        .map(|(column, values)| {
+                            (
+                                column,
+                                values.iter().map(|v| self.p.div(v, divisor)).collect(),
+                            )
+                        })
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(rows))
+    }
 }
 
 impl PreparedFrobenius {
@@ -145,8 +216,15 @@ impl PreparedFrobenius {
         order: usize,
         context: &RunContext,
         strict: bool,
+        prepared_rows: &crate::ode::prepared::PreparedRows,
     ) -> Result<FrobeniusBasis> {
-        let domain = NumericalDomain { p, values, strict };
+        let domain = NumericalDomain {
+            p,
+            values,
+            strict,
+            prepared_rows,
+            streaming: None,
+        };
         let normal = self.recurrence_normal(&domain, order, context)?;
         let columns = self.transform_recurrence(&domain, normal, order, context)?;
         Ok(FrobeniusBasis {
@@ -160,6 +238,40 @@ impl PreparedFrobenius {
             precision: p,
         })
     }
+
+    pub(super) fn numerical_recurrence_visit(
+        &self,
+        p: Precision,
+        values: &ahash::HashMap<Atom, C>,
+        order: usize,
+        context: &RunContext,
+        prepared_rows: &crate::ode::prepared::PreparedRows,
+        admission: &super::streaming::StreamingAdmission,
+        mut visitor: impl FnMut(FrobeniusColumn) -> Result<()>,
+    ) -> Result<()> {
+        let domain = NumericalDomain {
+            p,
+            values,
+            strict: false,
+            prepared_rows,
+            streaming: Some(admission),
+        };
+        self.recurrence_normal_visit(&domain, order, context, false, |normal| {
+            let column = if self.identity_transformation() {
+                // The native column already has the physical coefficients and
+                // exponent. Move it without allocating a duplicate long series.
+                normal
+            } else {
+                let mut transformed =
+                    self.transform_recurrence(&domain, vec![normal], order, context)?;
+                transformed.pop().expect("one transformed Frobenius column")
+            };
+            visitor(FrobeniusColumn {
+                exponent: column.exponent,
+                coefficients: column.coefficients,
+            })
+        })
+    }
 }
 
 impl PreparedFrobenius {
@@ -169,17 +281,49 @@ impl PreparedFrobenius {
         order: usize,
         context: &RunContext,
     ) -> Result<Vec<RecurrenceColumn<D::Scalar>>> {
+        let mut columns = Vec::new();
+        self.recurrence_normal_visit(domain, order, context, true, |column| {
+            columns.push(column);
+            Ok(())
+        })?;
+        Ok(columns)
+    }
+
+    fn recurrence_normal_visit<D: CoefficientDomain>(
+        &self,
+        domain: &D,
+        order: usize,
+        context: &RunContext,
+        retain_solvers: bool,
+        mut visitor: impl FnMut(RecurrenceColumn<D::Scalar>) -> Result<()>,
+    ) -> Result<()> {
         let n = self.normal.matrix.len();
         domain.preflight(n, order)?;
-        let mut a = vec![vec![vec![domain.zero(); n]; n]; order + 1];
-        for (i, row) in self.normal.matrix.iter().enumerate() {
-            context.cancellation.check()?;
-            for (j, expr) in row.iter().enumerate() {
-                domain.preflight_series(expr, self.source.variable, order)?;
-                let expr = (expr * Atom::var(self.source.variable)).together().cancel();
-                let series = domain.series(&expr, self.source.variable, order)?;
-                for k in 0..=order {
-                    a[k][i][j] = series[k].clone();
+        let polynomial_rows = domain.polynomial_rows(&self.normal, context)?;
+        let mut a = vec![
+            vec![vec![domain.zero(); n]; n];
+            if polynomial_rows.is_some() {
+                1
+            } else {
+                order + 1
+            }
+        ];
+        if let Some(rows) = &polynomial_rows {
+            for (i, row) in rows.iter().enumerate() {
+                for (column, coefficients) in &row.entries {
+                    a[0][i][*column] = coefficients[0].clone();
+                }
+            }
+        } else {
+            for (i, row) in self.normal.matrix.iter().enumerate() {
+                context.cancellation.check()?;
+                for (j, expr) in row.iter().enumerate() {
+                    domain.preflight_series(expr, self.source.variable, order)?;
+                    let expr = (expr * Atom::var(self.source.variable)).together().cancel();
+                    let series = domain.series(&expr, self.source.variable, order)?;
+                    for k in 0..=order {
+                        a[k][i][j] = series[k].clone();
+                    }
                 }
             }
         }
@@ -199,7 +343,6 @@ impl PreparedFrobenius {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let mut columns = Vec::new();
         for space in &self.eigenspaces {
             context.cancellation.check()?;
             let lambda = &space.exponent;
@@ -220,6 +363,8 @@ impl PreparedFrobenius {
                 while leading.len() > 1 && leading.last().unwrap().iter().all(|v| v == &zero) {
                     leading.pop();
                 }
+                let mut logs = leading.len();
+                domain.preflight_column(n, order, logs)?;
                 let mut coefficients = vec![leading];
                 for k in 1..=order {
                     context.cancellation.check()?;
@@ -239,15 +384,52 @@ impl PreparedFrobenius {
                             break;
                         }
                     }
-                    let logs = coefficients.iter().map(|c| c.len()).max().unwrap();
                     let mut rhs = vec![vec![domain.zero(); n]; logs];
-                    for j in 1..=k {
-                        for (l, previous) in coefficients[k - j].iter().enumerate() {
-                            for &(i, column, value) in &sparse[j] {
-                                if previous[column] != zero {
-                                    rhs[l][i] = domain
-                                        .add(&rhs[l][i], &domain.mul(value, &previous[column]));
-                                    domain.check_value(&rhs[l][i])?;
+                    if let Some(rows) = &polynomial_rows {
+                        for (i, row) in rows.iter().enumerate() {
+                            for (column, polynomial) in &row.entries {
+                                for (j, value) in polynomial.iter().enumerate().skip(1).take(k) {
+                                    if value == &zero {
+                                        continue;
+                                    }
+                                    for (l, previous) in coefficients[k - j].iter().enumerate() {
+                                        if previous[*column] != zero {
+                                            rhs[l][i] = domain.add(
+                                                &rhs[l][i],
+                                                &domain.mul(value, &previous[*column]),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            for (j, value) in row.denominator.iter().enumerate().skip(1).take(k) {
+                                if value == &zero {
+                                    continue;
+                                }
+                                let previous = &coefficients[k - j];
+                                let weight = domain.add(&exponent, &domain.integer((k - j) as i64));
+                                for (l, previous_row) in previous.iter().enumerate() {
+                                    let mut derivative = domain.mul(&weight, &previous_row[i]);
+                                    if let Some(next_log) = previous.get(l + 1) {
+                                        derivative = domain.add(
+                                            &derivative,
+                                            &domain.scale(&next_log[i], (l + 1) as i64, 1),
+                                        );
+                                    }
+                                    rhs[l][i] =
+                                        domain.sub(&rhs[l][i], &domain.mul(value, &derivative));
+                                }
+                            }
+                        }
+                    } else {
+                        for j in 1..=k {
+                            for (l, previous) in coefficients[k - j].iter().enumerate() {
+                                for &(i, column, value) in &sparse[j] {
+                                    if previous[column] != zero {
+                                        rhs[l][i] = domain
+                                            .add(&rhs[l][i], &domain.mul(value, &previous[column]));
+                                        domain.check_value(&rhs[l][i])?;
+                                    }
                                 }
                             }
                         }
@@ -296,9 +478,19 @@ impl PreparedFrobenius {
                             )
                         })?;
                     } else {
-                        if solvers[k].is_none() {
-                            solvers[k] = Some(domain.solver(m.clone(), &self.blocks, context)?);
-                        }
+                        // Retain a factorization only if another leading vector
+                        // will reuse it. At very high precision a long sequence
+                        // of single-use factorizations is otherwise substantial.
+                        let fresh_solver;
+                        let solver = if !retain_solvers || space.leading.len() == 1 {
+                            fresh_solver = domain.solver(m, &self.blocks, context)?;
+                            &fresh_solver
+                        } else {
+                            if solvers[k].is_none() {
+                                solvers[k] = Some(domain.solver(m, &self.blocks, context)?);
+                            }
+                            solvers[k].as_ref().unwrap()
+                        };
                         for l in (0..logs).rev() {
                             if l + 1 < logs {
                                 for i in 0..n {
@@ -308,7 +500,7 @@ impl PreparedFrobenius {
                                     );
                                 }
                             }
-                            next[l] = domain.solve(solvers[k].as_ref().unwrap(), &rhs[l])?;
+                            next[l] = domain.solve(solver, &rhs[l])?;
                         }
                     }
                     while next.len() > 1
@@ -317,15 +509,17 @@ impl PreparedFrobenius {
                         next.pop();
                     }
                     domain.check_rows(&next)?;
+                    logs = logs.max(next.len());
+                    domain.preflight_column(n, order, logs)?;
                     coefficients.push(next);
                 }
-                columns.push(RecurrenceColumn {
+                visitor(RecurrenceColumn {
                     exponent: lambda.clone(),
                     coefficients,
-                });
+                })?;
             }
         }
-        Ok(columns)
+        Ok(())
     }
 }
 impl PreparedFrobenius {
