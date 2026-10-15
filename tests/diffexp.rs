@@ -324,3 +324,79 @@ fn coefficient_transport_preserves_logarithm_monodromy() {
         }
     }
 }
+
+fn epsilon_domain_source(text: &str) -> DifferentialSystem {
+    DifferentialSystem {
+        variable: symbol!("epsilon_input_domain::x"),
+        matrix: vec![vec![
+            Atom::parse(text, "epsilon_input_domain", Default::default()).unwrap(),
+        ]],
+    }
+}
+
+#[test]
+fn epsilon_domain_rejects_fractional_power() {
+    assert!(matches!(
+        EpsilonSystem::from_differential_system(
+            &epsilon_domain_source("eps^(1/2)"),
+            symbol!("epsilon_input_domain::eps"),
+            5,
+        ),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn epsilon_domain_rejects_fractional_power_above_requested_order() {
+    assert!(matches!(
+        EpsilonSystem::from_differential_system(
+            &epsilon_domain_source("eps^(101/2)"),
+            symbol!("epsilon_input_domain::eps"),
+            2,
+        ),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn epsilon_domain_rejects_fractional_function() {
+    assert!(matches!(
+        EpsilonSystem::from_differential_system(
+            &epsilon_domain_source("symbolica::exp(eps^(1/2))"),
+            symbol!("epsilon_input_domain::eps"),
+            4,
+        ),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn epsilon_domain_rejects_mixed_integer_and_fractional_input() {
+    assert!(matches!(
+        EpsilonSystem::from_differential_system(
+            &epsilon_domain_source("1/(1-eps)+eps^(1/2)"),
+            symbol!("epsilon_input_domain::eps"),
+            3,
+        ),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn epsilon_domain_preserves_independent_exact_coefficients() {
+    for coefficient in ["x^(1/2)", "symbolica::gamma(1/3)"] {
+        let source = epsilon_domain_source(&format!("({coefficient})/(1-eps)"));
+        let expected =
+            Atom::parse(coefficient, "epsilon_input_domain", Default::default()).unwrap();
+        let expanded = EpsilonSystem::from_differential_system(
+            &source,
+            symbol!("epsilon_input_domain::eps"),
+            5,
+        )
+        .unwrap();
+        assert_eq!(expanded.matrices.len(), 6);
+        for matrix in expanded.matrices {
+            assert!((&matrix[0][0] - &expected).together().cancel().is_zero());
+        }
+    }
+}

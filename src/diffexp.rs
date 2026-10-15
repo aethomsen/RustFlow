@@ -110,10 +110,33 @@ impl EpsilonSystem {
                 // In particular, do not accept floating coefficients or
                 // fractional epsilon powers as an ordinary Taylor series.
                 let a = crate::family::encode_complex(a);
-                let _: RationalPolynomial<IntegerRing, u16> =
+                let rational: RationalPolynomial<IntegerRing, u16> =
                     a.try_to_rational_polynomial(&Q, &Z, None).map_err(|e| {
                         Error::Unsupported(format!("rational epsilon system required: {e}"))
                     })?;
+                // Polynomial conversion can promote a function or fractional
+                // power to an indeterminate. Inspect its epsilon dependence
+                // before truncation, including powers above the requested order.
+                // Exact epsilon-independent coefficient expressions stay valid.
+                if rational
+                    .numerator
+                    .variables()
+                    .iter()
+                    .enumerate()
+                    .any(|(index, variable)| match variable {
+                        PolyVariable::Function(_, expression) | PolyVariable::Power(expression) => {
+                            expression.contains_symbol(epsilon)
+                                && (rational.numerator.degree_bounds(index).1 != 0
+                                    || rational.denominator.degree_bounds(index).1 != 0)
+                        }
+                        _ => false,
+                    })
+                {
+                    return Err(Error::Unsupported(
+                        "matrix must have rational epsilon dependence; compound epsilon indeterminate"
+                            .into(),
+                    ));
+                }
                 let expansion = a
                     .series(epsilon, 0, order as i64 + 1)
                     .map_err(|e| Error::Unsupported(e.to_string()))?;
