@@ -327,26 +327,6 @@ pub(crate) fn polynomial_product(
     Ok(result)
 }
 
-pub(crate) fn row_reduce(
-    rows: Vec<Vec<Gaussian>>,
-    columns: usize,
-    limits: &ExactFrobeniusLimits,
-    context: &RunContext,
-) -> Result<Vec<Vec<Gaussian>>> {
-    if rows.is_empty() || rows.iter().any(|row| row.len() != columns + 1) {
-        return Err(Error::InvalidInput(
-            "exact asymptotic relation matrix dimensions".into(),
-        ));
-    }
-    row_reduce_with_mode(
-        rows,
-        columns,
-        limits,
-        context,
-        ExactEliminationMode::ConservativeDense,
-    )
-}
-
 pub(crate) fn row_reduce_with_mode(
     rows: Vec<Vec<Gaussian>>,
     columns: usize,
