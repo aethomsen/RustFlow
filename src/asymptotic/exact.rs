@@ -1,5 +1,7 @@
 //! Explicit exact relations among generalized-series coefficients.
-use crate::frobenius::exact::{Gaussian, gaussian, gaussian_bounded, multiply, row_reduce};
+use crate::frobenius::exact::{
+    Gaussian, gaussian, gaussian_bounded, multiply, row_reduce_with_mode,
+};
 use crate::frobenius::{ExactFrobeniusBasis, ExactFrobeniusLimits};
 use crate::{Error, Result, RunContext};
 use std::collections::BTreeMap;
@@ -258,7 +260,7 @@ impl ExactFrobeniusBasis {
             row[n] = gaussian(&relation.value)?;
             equations.push(row);
         }
-        let reduced = row_reduce(equations, n, limits, context)?;
+        let reduced = row_reduce_with_mode(equations, n, limits, context, self.elimination_mode)?;
         let mut pivots = Vec::new();
         let mut offset = vec![zero(); n];
         for row in &reduced {

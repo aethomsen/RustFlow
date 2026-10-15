@@ -53,6 +53,13 @@ pub(crate) fn nullspace(a: Vec<Vec<Atom>>) -> Vec<Vec<Atom>> {
         .collect()
 }
 
+/// Representation choice only: structural exact zeros never use a tolerance.
+fn structurally_sparse(matrix: &[Vec<Atom>]) -> bool {
+    let entries = matrix.iter().map(Vec::len).sum::<usize>();
+    let nonzero = matrix.iter().flatten().filter(|a| !a.is_zero()).count();
+    nonzero <= entries / 4
+}
+
 pub(crate) fn matmul(a: &[Vec<Atom>], b: &[Vec<Atom>]) -> Vec<Vec<Atom>> {
     if a.is_empty() {
         return Vec::new();
@@ -65,7 +72,14 @@ pub(crate) fn matmul(a: &[Vec<Atom>], b: &[Vec<Atom>]) -> Vec<Vec<Atom>> {
         .expect("internal rectangular matrix");
     let right = symbolica::tensors::matrix::Matrix::from_nested_vec(b.to_vec(), exact_atom_field())
         .expect("internal rectangular matrix");
-    (&left * &right)
+    let product = if structurally_sparse(a) || structurally_sparse(b) {
+        // Reuse Symbolica's exact sparse multiplication when at least one
+        // input has at most one quarter structurally nonzero entries.
+        (&left.to_sparse() * &right.to_sparse()).to_dense()
+    } else {
+        &left * &right
+    };
+    product
         .into_vec()
         .chunks(columns)
         .map(|row| row.iter().map(|a| a.together().cancel()).collect())
@@ -162,3 +176,7 @@ pub(crate) fn eigenvalues(residue: &[Vec<Atom>]) -> Result<Vec<(Atom, usize)>> {
     }
     Ok(result)
 }
+
+#[cfg(test)]
+#[path = "algebra_matmul_tests.rs"]
+mod representation_tests;

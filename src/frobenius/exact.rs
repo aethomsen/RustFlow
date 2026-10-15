@@ -5,12 +5,29 @@ use super::*;
 use symbolica::domains::float::FloatField;
 use symbolica::tensors::matrix::Matrix;
 mod resources;
+mod sparse_policy;
+#[cfg(test)]
+mod sparse_policy_tests;
 pub(crate) use resources::preflight_operation;
 #[cfg(test)]
 mod series_tests;
 
 pub(crate) type Gaussian = Complex<Rational>;
 type ExactMatrix = Matrix<FloatField<Gaussian>>;
+
+/// Native elimination policy for exact Frobenius coefficients and their constraints.
+///
+/// The default retains conservative dense preflight estimates. The opt-in sparse
+/// policy uses native sparse inversion with input/output height checks. For
+/// resonant solves and constraints it also observes native reducer heights after
+/// every inserted row and after back substitution. Inverse internals and arithmetic
+/// inside a native row operation are unobserved; transient allocations are not bounded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExactEliminationMode {
+    #[default]
+    ConservativeDense,
+    ObservedSparse,
+}
 
 /// Conservative admission limits for exact coefficient work, not allocator quotas.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, bincode::Encode, bincode::Decode)]
@@ -55,8 +72,13 @@ pub struct ExactFrobeniusBasis {
     pub(crate) columns: Vec<RecurrenceColumn<Gaussian>>,
     pub(crate) known_order: usize,
     pub(crate) limits: ExactFrobeniusLimits,
+    pub(crate) elimination_mode: ExactEliminationMode,
 }
 impl ExactFrobeniusBasis {
+    /// Elimination policy retained by this exact basis for subsequent constraints.
+    pub fn elimination_mode(&self) -> ExactEliminationMode {
+        self.elimination_mode
+    }
     pub fn dimension(&self) -> usize {
         self.columns.len()
     }
@@ -120,7 +142,7 @@ pub(crate) fn gaussian_bounded(
     limits: &ExactFrobeniusLimits,
     context: &RunContext,
 ) -> Result<Gaussian> {
-    let domain = ExactDomain { limits, context };
+    let domain = ExactDomain::dense(limits, context);
     domain.preflight_series(
         expression,
         symbol!("symbolica_amflow::exact_constant_preflight"),
@@ -152,7 +174,7 @@ pub(crate) fn preflight_expression(
     limits: &ExactFrobeniusLimits,
     context: &RunContext,
 ) -> Result<()> {
-    ExactDomain { limits, context }.preflight_series(expression, variable, order)
+    ExactDomain::dense(limits, context).preflight_series(expression, variable, order)
 }
 
 /// The caller proves H(0)=1 exactly. Native series arithmetic then selects the
@@ -165,7 +187,7 @@ pub(crate) fn normalized_root_series(
     limits: &ExactFrobeniusLimits,
     context: &RunContext,
 ) -> Result<Vec<Gaussian>> {
-    let domain = ExactDomain { limits, context };
+    let domain = ExactDomain::dense(limits, context);
     domain.preflight_series(h, variable, order)?;
     domain.preflight_series(factor, variable, order)?;
     let h0 = crate::family::substitute(h, &BTreeMap::from([(Atom::var(variable), Atom::new())]))
@@ -228,7 +250,7 @@ pub(crate) fn rank(
     limits: &ExactFrobeniusLimits,
     context: &RunContext,
 ) -> Result<usize> {
-    let domain = ExactDomain { limits, context };
+    let domain = ExactDomain::dense(limits, context);
     domain.matrix_bound(rows)?;
     let matrix = ExactMatrix::from_nested_vec(rows.to_vec(), field()).map_err(Error::Numerical)?;
     let result = matrix.rank();
@@ -241,7 +263,7 @@ pub(crate) fn inverse(
     limits: &ExactFrobeniusLimits,
     context: &RunContext,
 ) -> Result<Vec<Vec<Gaussian>>> {
-    let domain = ExactDomain { limits, context };
+    let domain = ExactDomain::dense(limits, context);
     domain.matrix_bound(rows)?;
     let n = rows.len();
     let inverse = ExactMatrix::from_nested_vec(rows.to_vec(), field())
@@ -264,7 +286,7 @@ pub(crate) fn polynomial_product(
     limits: &ExactFrobeniusLimits,
     context: &RunContext,
 ) -> Result<Vec<Gaussian>> {
-    let domain = ExactDomain { limits, context };
+    let domain = ExactDomain::dense(limits, context);
     domain.check_rows(&[a.clone(), b.clone()])?;
     while a.len() > 1 && a.last().is_some_and(Gaussian::is_zero) {
         a.pop();
@@ -316,8 +338,36 @@ pub(crate) fn row_reduce(
             "exact asymptotic relation matrix dimensions".into(),
         ));
     }
-    let domain = ExactDomain { limits, context };
+    row_reduce_with_mode(
+        rows,
+        columns,
+        limits,
+        context,
+        ExactEliminationMode::ConservativeDense,
+    )
+}
+
+pub(crate) fn row_reduce_with_mode(
+    rows: Vec<Vec<Gaussian>>,
+    columns: usize,
+    limits: &ExactFrobeniusLimits,
+    context: &RunContext,
+    elimination_mode: ExactEliminationMode,
+) -> Result<Vec<Vec<Gaussian>>> {
+    if rows.is_empty() || rows.iter().any(|row| row.len() != columns + 1) {
+        return Err(Error::InvalidInput(
+            "exact asymptotic relation matrix dimensions".into(),
+        ));
+    }
+    let domain = ExactDomain {
+        limits,
+        context,
+        elimination_mode,
+    };
     limits.validate()?;
+    if elimination_mode == ExactEliminationMode::ObservedSparse {
+        return domain.sparse_reduced_rows(rows);
+    }
     domain.matrix_bound(&rows)?;
     let mut matrix = ExactMatrix::from_nested_vec(rows, field()).map_err(Error::Numerical)?;
     matrix.row_reduce(columns as u32);
@@ -383,15 +433,23 @@ pub(crate) fn multiply(
         .chunks(columns)
         .map(<[Gaussian]>::to_vec)
         .collect::<Vec<_>>();
-    ExactDomain { limits, context }.check_rows(&result)?;
+    ExactDomain::dense(limits, context).check_rows(&result)?;
     Ok(result)
 }
 
 struct ExactDomain<'a> {
     limits: &'a ExactFrobeniusLimits,
     context: &'a RunContext,
+    elimination_mode: ExactEliminationMode,
 }
-impl ExactDomain<'_> {
+impl<'a> ExactDomain<'a> {
+    fn dense(limits: &'a ExactFrobeniusLimits, context: &'a RunContext) -> Self {
+        Self {
+            limits,
+            context,
+            elimination_mode: ExactEliminationMode::ConservativeDense,
+        }
+    }
     fn series_bound(
         &self,
         view: AtomView<'_>,
@@ -553,9 +611,13 @@ impl CoefficientDomain for ExactDomain<'_> {
     fn solver(
         &self,
         matrix: Vec<Vec<Gaussian>>,
-        _blocks: &[Vec<usize>],
+        blocks: &[Vec<usize>],
         context: &RunContext,
     ) -> Result<ExactMatrix> {
+        if self.elimination_mode == ExactEliminationMode::ObservedSparse {
+            self.validate_sparse_blocks(&matrix, blocks)?;
+            return self.sparse_inverse(matrix, context);
+        }
         self.matrix_bound(&matrix)?;
         let matrix = ExactMatrix::from_nested_vec(matrix, field()).map_err(Error::Numerical)?;
         let inverse = matrix
@@ -594,6 +656,9 @@ impl CoefficientDomain for ExactDomain<'_> {
         rhs: Vec<Gaussian>,
         context: &RunContext,
     ) -> Result<Vec<Gaussian>> {
+        if self.elimination_mode == ExactEliminationMode::ObservedSparse {
+            return self.sparse_solve_any(matrix, rhs, context);
+        }
         let augmented = matrix
             .iter()
             .zip(&rhs)
@@ -701,7 +766,33 @@ impl PreparedFrobenius {
         limits: &ExactFrobeniusLimits,
         context: &RunContext,
     ) -> Result<ExactFrobeniusBasis> {
-        let domain = ExactDomain { limits, context };
+        self.exact_coefficients_with_elimination(
+            order,
+            limits,
+            ExactEliminationMode::ConservativeDense,
+            context,
+        )
+    }
+
+    /// Compute an exact prefix with an explicitly selected native elimination policy.
+    /// All existing dimension, series, allocation and observed coefficient limits
+    /// remain active. Sparse mode substitutes operation-specific observed height
+    /// checks for the conservative dense elimination estimate only: inverse inputs
+    /// and outputs, plus native row boundaries for resonances and constraints.
+    /// Internal inverse/elimination arithmetic remains unobserved. No numerical
+    /// amplitudes or precision thresholds enter this operation.
+    pub fn exact_coefficients_with_elimination(
+        &self,
+        order: usize,
+        limits: &ExactFrobeniusLimits,
+        elimination_mode: ExactEliminationMode,
+        context: &RunContext,
+    ) -> Result<ExactFrobeniusBasis> {
+        let domain = ExactDomain {
+            limits,
+            context,
+            elimination_mode,
+        };
         domain.preflight(self.source.matrix.len(), order)?;
         for exponent in self.exponents() {
             let value = gaussian_bounded(exponent, limits, context)?;
@@ -717,6 +808,7 @@ impl PreparedFrobenius {
             columns,
             known_order: order,
             limits: limits.clone(),
+            elimination_mode,
         })
     }
 }

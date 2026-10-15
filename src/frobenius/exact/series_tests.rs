@@ -28,6 +28,7 @@ fn native_nonconstant_unit_root_grid_ignores_only_exact_zero_fractional_slots() 
         &ExactDomain {
             limits: &limits,
             context: &context,
+            elimination_mode: ExactEliminationMode::ConservativeDense,
         },
     )
     .unwrap();
@@ -58,7 +59,8 @@ fn nonzero_fractional_power_is_not_discarded_as_a_ramification_slot() {
             4,
             &ExactDomain {
                 limits: &limits,
-                context: &context
+                context: &context,
+                elimination_mode: ExactEliminationMode::ConservativeDense
             }
         ),
         Err(Error::Unsupported(_))

@@ -2,6 +2,10 @@
 use crate::{DifferentialSystem, Error, Result, algebra};
 use symbolica::prelude::*;
 
+#[cfg(test)]
+#[path = "normalize_tests.rs"]
+mod nilpotent_candidate_tests;
+
 fn identity(n: usize) -> Vec<Vec<Atom>> {
     (0..n)
         .map(|i| (0..n).map(|j| Atom::num(i64::from(i == j))).collect())
@@ -40,18 +44,30 @@ fn leading(system: &DifferentialSystem) -> Result<(i64, Vec<Vec<Atom>>)> {
 /// Jordan chains ordered by decreasing length, with each chain starting in ker N.
 fn nilpotent_chains(a: &[Vec<Atom>]) -> Result<Vec<Vec<Vec<Atom>>>> {
     let n = a.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
     let mut powers = vec![identity(n)];
+    let mut nilpotency_index = None;
     for k in 1..=n {
         powers.push(algebra::matmul(&powers[k - 1], a));
+        if powers[k].iter().flatten().all(Atom::is_zero) {
+            // This is an exact coefficient-field certificate, never a numerical
+            // threshold. Every higher power is zero as well.
+            nilpotency_index = Some(k);
+            break;
+        }
     }
-    if powers[n].iter().flatten().any(|a| !a.is_zero()) {
+    let Some(nilpotency_index) = nilpotency_index else {
         return Err(Error::Unsupported(
             "irreducible irregular singularity has nonnilpotent leading matrix".into(),
         ));
-    }
+    };
     let mut basis = Vec::new();
     let mut chains = Vec::new();
-    for length in (1..=n).rev() {
+    // A longer candidate starts with a zero vector, so the original rank test
+    // always rejects it. Keep the order of every potentially accepted candidate.
+    for length in (1..=nilpotency_index).rev() {
         for vector in algebra::nullspace(powers[length].clone()) {
             let chain = (0..length)
                 .rev()
@@ -71,6 +87,10 @@ fn nilpotent_chains(a: &[Vec<Atom>]) -> Result<Vec<Vec<Vec<Atom>>>> {
             if algebra::rref(trial.clone()).1.len() == basis.len() + length {
                 basis = trial;
                 chains.push(chain);
+                if basis.len() == n {
+                    // No later positive-length candidate can increase rank past n.
+                    return Ok(chains);
+                }
             }
         }
     }
@@ -80,6 +100,25 @@ fn nilpotent_chains(a: &[Vec<Atom>]) -> Result<Vec<Vec<Vec<Atom>>>> {
         ));
     }
     Ok(chains)
+}
+
+/// Contract the selected inverse rows, subleading matrix and first chain vectors
+/// with the existing native matrix owner. Their order is the Jordan-chain order.
+fn projector_l0(
+    chains: &[Vec<Vec<Atom>>],
+    subleading: &[Vec<Atom>],
+    inverse: &[Vec<Atom>],
+    starts: &[usize],
+) -> Vec<Vec<Atom>> {
+    let left = chains
+        .iter()
+        .zip(starts)
+        .map(|(chain, &start)| inverse[start + chain.len() - 1].clone())
+        .collect::<Vec<_>>();
+    let right = (0..subleading.len())
+        .map(|i| chains.iter().map(|chain| chain[0][i].clone()).collect())
+        .collect::<Vec<Vec<_>>>();
+    algebra::matmul(&algebra::matmul(&left, subleading), &right)
 }
 
 /// AMFlow's ReduceL0/FindProjector algorithm: mix equal-position Jordan
@@ -107,23 +146,7 @@ fn refined_projector(
             start
         })
         .collect::<Vec<_>>();
-    let mut l0 = (0..m)
-        .map(|i| {
-            (0..m)
-                .map(|j| {
-                    let left = &inverse[starts[i] + lengths[i] - 1];
-                    (0..n)
-                        .fold(Atom::new(), |sum, a| {
-                            sum + (0..n).fold(Atom::new(), |sum, b| {
-                                sum + &left[a] * &subleading[a][b] * &chains[j][0][b]
-                            })
-                        })
-                        .together()
-                        .cancel()
-                })
-                .collect()
-        })
-        .collect::<Vec<Vec<_>>>();
+    let mut l0 = projector_l0(chains, subleading, &inverse, &starts);
     let mut delta = vec![vec![Atom::new(); m]; m];
     let mut selected = Vec::new();
     loop {

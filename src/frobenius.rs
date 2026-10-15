@@ -11,7 +11,7 @@ pub(crate) mod exact;
 mod projection_tests;
 mod recurrence;
 mod streaming;
-pub use exact::{ExactFrobeniusBasis, ExactFrobeniusLimits};
+pub use exact::{ExactEliminationMode, ExactFrobeniusBasis, ExactFrobeniusLimits};
 
 use crate::{
     ComplexFloat as C, DifferentialSystem, Error, Precision, Progress, Result, RunContext,
