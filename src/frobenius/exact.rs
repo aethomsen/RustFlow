@@ -56,7 +56,7 @@ impl ExactFrobeniusLimits {
             || self.max_coefficient_bits == 0
             || self.max_coefficient_bits > 1_048_576
             || self.max_scalar_cells == 0
-            || self.max_scalar_cells > 16_000_000
+            || self.max_scalar_cells > 32_000_000
         {
             return Err(Error::InvalidInput(
                 "invalid exact Frobenius resource limits".into(),
