@@ -15,10 +15,16 @@ pub mod pade;
 #[path = "ode/source.rs"]
 pub(crate) mod source;
 use residual::RationalResidualChart;
+#[path = "ode/compression.rs"]
+mod compression;
 #[path = "ode/fundamental.rs"]
 pub(crate) mod fundamental;
 #[path = "ode/prepared.rs"]
 pub(crate) mod prepared;
+pub use compression::{CompiledStateCompression, StateCompression};
+#[cfg(test)]
+#[path = "ode/compression_tests.rs"]
+mod compression_tests;
 use symbolica::domains::float::FloatField;
 use symbolica::poly::univariate::UnivariatePolynomial;
 use symbolica::prelude::*;
