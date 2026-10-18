@@ -47,6 +47,9 @@ impl StreamingAdmission {
             .saturating_mul(8)
             .saturating_add(n.saturating_mul(n).saturating_mul(257));
         series
+            // Contraction evaluates one short leading log chain before moving
+            // it into the long column; count that temporary before allocation.
+            .saturating_add(n.saturating_mul(logs as u128))
             .saturating_add(workspace)
             .saturating_mul(crate::series_limits::complex_bytes(p))
     }
@@ -90,6 +93,9 @@ impl PreparedFrobenius {
     /// basis can determine them with existing asymptotic matching. This reuses
     /// the same recurrence and basis transformation, disables order-long solver
     /// retention, and releases each column after accumulating its contribution.
+    /// Equal exact exponents without any positive-order resonance share one
+    /// combined recurrence; resonant groups retain their original columns.
+    /// Every nonzero logarithm row is retained in a combined recurrence.
     ///
     /// The return value is a truncated expansion, not an accuracy certificate.
     /// Matching uncertainty, truncation, cancellation and branch choices still
@@ -135,12 +141,18 @@ impl PreparedFrobenius {
             point,
             winding,
             context,
-            |index, values| {
+            Some(constants),
+            |indices, values| {
                 if result.is_empty() {
                     result.resize(n, p.zero());
                 }
                 for (target, value) in result.iter_mut().zip(values) {
-                    *target = p.add(target, &p.mul(&constants[index], &value));
+                    let contribution = if indices.len() == 1 {
+                        p.mul(&constants[indices.start], &value)
+                    } else {
+                        value
+                    };
+                    *target = p.add(target, &contribution);
                 }
                 Ok(())
             },
@@ -197,12 +209,16 @@ impl PreparedFrobenius {
             point,
             winding,
             context,
-            |index, values| {
+            None,
+            |indices, values| {
+                if indices.len() != 1 {
+                    return Err(Error::Numerical("contracted matching column".into()));
+                }
                 if matrix.is_empty() {
                     matrix = vec![vec![p.zero(); n]; n];
                 }
                 for (row, value) in matrix.iter_mut().zip(values) {
-                    row[index] = value;
+                    row[indices.start] = value;
                 }
                 Ok(())
             },
@@ -219,7 +235,8 @@ impl PreparedFrobenius {
         point: &C,
         winding: i32,
         context: &RunContext,
-        mut visitor: impl FnMut(usize, Vec<C>) -> Result<()>,
+        constants: Option<&[C]>,
+        mut visitor: impl FnMut(std::ops::Range<usize>, Vec<C>) -> Result<()>,
     ) -> Result<()> {
         let n = self.source.matrix.len();
         let (prepared_rows, source_values) =
@@ -235,7 +252,8 @@ impl PreparedFrobenius {
             context,
             &prepared_rows,
             &admission,
-            |column| {
+            constants,
+            |indices, column| {
                 context.cancellation.check()?;
                 if column
                     .coefficients
@@ -246,8 +264,10 @@ impl PreparedFrobenius {
                 {
                     return Err(Error::Numerical("nonfinite Frobenius coefficient".into()));
                 }
-                if index >= n {
-                    return Err(Error::Numerical("excess streamed Frobenius columns".into()));
+                if indices.start != index || indices.end > n || indices.is_empty() {
+                    return Err(Error::Numerical(
+                        "invalid streamed Frobenius column range".into(),
+                    ));
                 }
                 let values = evaluate::column_value(p, point, &log, parameters, &column)?;
                 if values.iter().any(|value| !p.finite(value)) {
@@ -255,8 +275,8 @@ impl PreparedFrobenius {
                         "nonfinite streamed Frobenius column value".into(),
                     ));
                 }
-                visitor(index, values)?;
-                index += 1;
+                index = indices.end;
+                visitor(indices, values)?;
                 Ok(())
             },
         )?;
@@ -302,3 +322,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "contracted_solution_tests.rs"]
+mod contracted_solution_tests;

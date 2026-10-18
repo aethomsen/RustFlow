@@ -247,7 +247,8 @@ impl PreparedFrobenius {
         context: &RunContext,
         prepared_rows: &crate::ode::prepared::PreparedRows,
         admission: &super::streaming::StreamingAdmission,
-        mut visitor: impl FnMut(FrobeniusColumn) -> Result<()>,
+        constants: Option<&[C]>,
+        mut visitor: impl FnMut(std::ops::Range<usize>, FrobeniusColumn) -> Result<()>,
     ) -> Result<()> {
         let domain = NumericalDomain {
             p,
@@ -256,21 +257,31 @@ impl PreparedFrobenius {
             prepared_rows,
             streaming: Some(admission),
         };
-        self.recurrence_normal_visit(&domain, order, context, false, |normal| {
-            let column = if self.identity_transformation() {
-                // The native column already has the physical coefficients and
-                // exponent. Move it without allocating a duplicate long series.
-                normal
-            } else {
-                let mut transformed =
-                    self.transform_recurrence(&domain, vec![normal], order, context)?;
-                transformed.pop().expect("one transformed Frobenius column")
-            };
-            visitor(FrobeniusColumn {
-                exponent: column.exponent,
-                coefficients: column.coefficients,
-            })
-        })
+        self.recurrence_normal_visit(
+            &domain,
+            order,
+            context,
+            false,
+            constants,
+            |indices, normal| {
+                let column = if self.identity_transformation() {
+                    // The native column already has the physical coefficients and
+                    // exponent. Move it without allocating a duplicate long series.
+                    normal
+                } else {
+                    let mut transformed =
+                        self.transform_recurrence(&domain, vec![normal], order, context)?;
+                    transformed.pop().expect("one transformed Frobenius column")
+                };
+                visitor(
+                    indices,
+                    FrobeniusColumn {
+                        exponent: column.exponent,
+                        coefficients: column.coefficients,
+                    },
+                )
+            },
+        )
     }
 }
 
@@ -282,7 +293,7 @@ impl PreparedFrobenius {
         context: &RunContext,
     ) -> Result<Vec<RecurrenceColumn<D::Scalar>>> {
         let mut columns = Vec::new();
-        self.recurrence_normal_visit(domain, order, context, true, |column| {
+        self.recurrence_normal_visit(domain, order, context, true, None, |_, column| {
             columns.push(column);
             Ok(())
         })?;
@@ -295,9 +306,13 @@ impl PreparedFrobenius {
         order: usize,
         context: &RunContext,
         retain_solvers: bool,
-        mut visitor: impl FnMut(RecurrenceColumn<D::Scalar>) -> Result<()>,
+        constants: Option<&[D::Scalar]>,
+        mut visitor: impl FnMut(std::ops::Range<usize>, RecurrenceColumn<D::Scalar>) -> Result<()>,
     ) -> Result<()> {
         let n = self.normal.matrix.len();
+        if constants.is_some_and(|values| values.len() != n) {
+            return Err(Error::InvalidInput("Frobenius constants dimension".into()));
+        }
         domain.preflight(n, order)?;
         let polynomial_rows = domain.polynomial_rows(&self.normal, context)?;
         let mut a = vec![
@@ -343,23 +358,63 @@ impl PreparedFrobenius {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        let mut first_column = 0;
         for space in &self.eigenspaces {
             context.cancellation.check()?;
             let lambda = &space.exponent;
             let exponent = domain.evaluate(lambda)?;
+            // Numerical constants can be combined before recurrence only when
+            // no positive-order singular solve can be reached. Use precisely
+            // the original exact-or-near predicate, including all exponents.
+            let mut contracted = constants.is_some() && space.leading.len() > 1;
+            if contracted {
+                'orders: for k in 1..=order {
+                    context.cancellation.check()?;
+                    if self.recurrence_resonance(domain, lambda, k)? {
+                        contracted = false;
+                        break 'orders;
+                    }
+                }
+            }
             let mut solvers = (0..=order)
                 .map(|_| None)
                 .collect::<Vec<Option<D::Solver>>>();
-            for vector in &space.leading {
+            let emitted = if contracted { 1 } else { space.leading.len() };
+            for column in 0..emitted {
                 context.cancellation.check()?;
-                let mut leading = vector
-                    .iter()
-                    .map(|log| {
-                        log.iter()
-                            .map(|x| domain.evaluate(x))
-                            .collect::<Result<Vec<_>>>()
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let indices = if contracted {
+                    first_column..first_column + space.leading.len()
+                } else {
+                    first_column + column..first_column + column + 1
+                };
+                let mut leading = if contracted {
+                    let logs = space.leading.iter().map(Vec::len).max().unwrap_or(1);
+                    // Admit before the temporary combined seed is allocated.
+                    domain.preflight_column(n, order, logs)?;
+                    let mut combined = vec![vec![domain.zero(); n]; logs];
+                    for (offset, vector) in space.leading.iter().enumerate() {
+                        context.cancellation.check()?;
+                        let weight =
+                            &constants.expect("contracted constants")[first_column + offset];
+                        for (destination, row) in combined.iter_mut().zip(vector) {
+                            for (sum, entry) in destination.iter_mut().zip(row) {
+                                *sum =
+                                    domain.add(sum, &domain.mul(weight, &domain.evaluate(entry)?));
+                                domain.check_value(sum)?;
+                            }
+                        }
+                    }
+                    combined
+                } else {
+                    space.leading[column]
+                        .iter()
+                        .map(|log| {
+                            log.iter()
+                                .map(|x| domain.evaluate(x))
+                                .collect::<Result<Vec<_>>>()
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
                 while leading.len() > 1 && leading.last().unwrap().iter().all(|v| v == &zero) {
                     leading.pop();
                 }
@@ -376,13 +431,11 @@ impl PreparedFrobenius {
                         row[i] =
                             domain.add(&row[i], &domain.add(&exponent, &domain.integer(k as i64)));
                     }
-                    let mut resonance = false;
-                    for other in self.eigenspaces.iter().map(|space| &space.exponent) {
-                        let difference = (lambda + Atom::num(k as i64) - other).together().cancel();
-                        if difference.is_zero() || domain.near_resonance(&difference)? {
-                            resonance = true;
-                            break;
-                        }
+                    let resonance = self.recurrence_resonance(domain, lambda, k)?;
+                    if contracted && resonance {
+                        return Err(Error::Numerical(
+                            "contracted Frobenius group reached a singular recurrence".into(),
+                        ));
                     }
                     let mut rhs = vec![vec![domain.zero(); n]; logs];
                     if let Some(rows) = &polynomial_rows {
@@ -504,7 +557,13 @@ impl PreparedFrobenius {
                         }
                     }
                     while next.len() > 1
-                        && next.last().unwrap().iter().all(|v| domain.insignificant(v))
+                        && next.last().unwrap().iter().all(|v| {
+                            if contracted {
+                                v == &zero
+                            } else {
+                                domain.insignificant(v)
+                            }
+                        })
                     {
                         next.pop();
                     }
@@ -513,13 +572,37 @@ impl PreparedFrobenius {
                     domain.preflight_column(n, order, logs)?;
                     coefficients.push(next);
                 }
-                visitor(RecurrenceColumn {
-                    exponent: lambda.clone(),
-                    coefficients,
-                })?;
+                visitor(
+                    indices,
+                    RecurrenceColumn {
+                        exponent: lambda.clone(),
+                        coefficients,
+                    },
+                )?;
             }
+            first_column += space.leading.len();
+        }
+        if first_column != n {
+            return Err(Error::Numerical("incomplete Frobenius eigenspaces".into()));
         }
         Ok(())
+    }
+
+    fn recurrence_resonance<D: CoefficientDomain>(
+        &self,
+        domain: &D,
+        lambda: &Atom,
+        order: usize,
+    ) -> Result<bool> {
+        for other in self.eigenspaces.iter().map(|space| &space.exponent) {
+            let difference = (lambda + Atom::num(order as i64) - other)
+                .together()
+                .cancel();
+            if difference.is_zero() || domain.near_resonance(&difference)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 impl PreparedFrobenius {
