@@ -55,6 +55,8 @@ pub mod kinematics;
 pub mod linear;
 pub mod local_coordinates;
 #[cfg(feature = "automatic")]
+mod massless_banana;
+#[cfg(feature = "automatic")]
 mod native;
 pub mod normalize;
 pub mod numeric;

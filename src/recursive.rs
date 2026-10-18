@@ -152,6 +152,10 @@ impl<'a> RecursiveBoundary<'a> {
                 Some(value)
             } else if scaleless(family, &target)? {
                 Some(p.zero())
+            } else if let Some(value) =
+                crate::massless_banana::evaluate(family, &target, epsilon, p)?
+            {
+                Some(value)
             } else if let Some(value) = vacuum_terminal(family, &target, epsilon, p)? {
                 Some(value)
             } else if let Some(plan) = crate::vacuum_peel::SingleMassPlan::find(family, &target)? {
