@@ -74,6 +74,20 @@ larger steps in the same chart. Each candidate passes the same checks; acceptanc
 is not assumed to be monotone in the step length. Only the selected candidate
 updates the solution, root state, observer or saved trajectory.
 
+
+With identity coordinates, Bracketed starts at up to three quarters of the
+nearest-pole radius; Halving retains its one-third-radius proposal. Failed
+proposals still backtrack through the same acceptance checks. Mapped-coordinate
+and entire-system proposals are unchanged.
+
+The public regression compares both strategies for `y′ = 2y/(1+x)`, with
+`y(0)=1`, continued to `x=100`. It checks the exact result `10201` and requires
+fewer committed charts with Bracketed:
+
+```sh
+cargo test --release --test bracketed_step_proposal -- --nocapture
+```
+
 `max_steps` counts every acceptance predicate, including rejected trials and
 successful trials replaced by a larger one. Diagnostics distinguish committed
 steps, rejected steps and superseded successes. On a successful continuation,

@@ -1358,7 +1358,14 @@ pub(crate) fn transport_series_observed<S: SeriesSystem>(
                             "path reached a differential-equation pole".into(),
                         ));
                     }
-                    let safe = radius / 3;
+                    // Bracketed continuation can start farther inside the same
+                    // convergence disk: a failed proposal still uses the shared
+                    // backtracking and candidate-specific acceptance checks.
+                    let safe = if options.step_size_strategy == StepSizeStrategy::Bracketed {
+                        radius * 3 / 4
+                    } else {
+                        radius / 3
+                    };
                     if distance > safe {
                         step = p.mul(
                             &delta,
