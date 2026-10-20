@@ -1,6 +1,7 @@
 use feynkit_graph::{EdgeId, IntegralFamily as NativeFamily, symbols};
 use feynkit_kinematics::Kinematics;
 use feynkit_model::Model;
+use idenso::tensor::SymbolicTensor;
 use std::{collections::BTreeMap, sync::Arc};
 use symbolica::prelude::*;
 use symbolica_amflow::{hepkit::GraphIntegral, *};
@@ -171,6 +172,29 @@ fn signed_numerators_and_native_tensor_contractions_reconstruct_the_integrand() 
 }
 
 #[test]
+fn structured_projector_routes_edge_momenta_and_applies_scalar_factors_once() {
+    let kin = kinematics(Atom::num(-1));
+    let plain = GraphIntegral::from_dot(model(), BUBBLE, &kin).unwrap();
+    let base = groups(&plain, &KinematicPoint::default());
+    let ds = denominators(&base[0].0);
+    let vector = SymbolicTensor::infer(scalar("gammalooprs::Q(2,spenso::mink(D_,mu))")).unwrap();
+    let diagram = plain
+        .diagram()
+        .as_ref()
+        .clone()
+        .with_numerator(vector.clone())
+        .unwrap()
+        .with_projector(vector)
+        .with_numerator_prefactor(SymbolicTensor::infer(Atom::num(7)).unwrap())
+        .with_overall_factor(Atom::num(3));
+    let graph = GraphIntegral::new(Arc::new(diagram), &kin).unwrap();
+    exact(
+        &integrand(&groups(&graph, &KinematicPoint::default())),
+        &(Atom::num(21) / &ds[1]),
+    );
+}
+
+#[test]
 fn exact_complex_native_bubble_reaches_the_automatic_solver_and_refines() {
     let s = Atom::num(symbolica::domains::float::Complex::new(
         Rational::from(-2),
@@ -283,6 +307,21 @@ fn native_fixed_dimensional_traces_are_literal_and_surviving_mixed_dimensions_ar
         "digraph massless_bubble {\n num=\"gammalooprs::K(0,spenso::mink(4,mu))*gammalooprs::K(0,spenso::mink(4,mu))\";",
     );
     let graph = GraphIntegral::from_dot(model(), &surviving, &kinematics(Atom::num(-1))).unwrap();
+    assert!(matches!(
+        graph.integral_groups(
+            &KinematicPoint::default(),
+            symbol!("feynkit_graph::eps"),
+            4,
+            1000,
+            &RunContext::default()
+        ),
+        Err(Error::Unsupported(_))
+    ));
+    let separated = BUBBLE.replace(
+        "digraph massless_bubble {",
+        "digraph massless_bubble {\n num=\"gammalooprs::K(0,spenso::mink(4,mu))\"; projector=\"gammalooprs::K(0,spenso::mink(4,mu))\";",
+    );
+    let graph = GraphIntegral::from_dot(model(), &separated, &kinematics(Atom::num(-1))).unwrap();
     assert!(matches!(
         graph.integral_groups(
             &KinematicPoint::default(),

@@ -2,6 +2,7 @@
 use crate::{Error, Result};
 use feynkit_kinematics::Kinematics;
 use feynkit_tensor::{TensorReducer, TensorReductionError};
+use idenso::tensor::SymbolicTensor;
 use std::collections::BTreeMap;
 use symbolica::prelude::*;
 
@@ -113,9 +114,11 @@ impl TensorProjector {
                             a * dot(&hard_head.call(hard), &external_head.call(external))?,
                         )
                     })?;
+            let numerator =
+                SymbolicTensor::infer(numerator).map_err(|error| native_error(error.into()))?;
             let reduced = TensorReducer::new(dimension.clone())
                 .with_integrated_head(hard_head)
-                .reduce(numerator.as_view())
+                .reduce(&numerator)
                 .map_err(native_error)?;
             if !reduced.is_fully_contracted() {
                 return Err(Error::Unsupported(
@@ -135,7 +138,7 @@ impl TensorProjector {
                     Ok((
                         coefficient.numerator.to_expression(),
                         coefficient.denominator.to_expression(),
-                        term.tensor().clone(),
+                        term.tensor().expression().clone(),
                     ))
                 })
                 .collect::<Result<Projection>>()?;

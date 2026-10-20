@@ -1,6 +1,7 @@
 #[path = "support/native_cut_graph.rs"]
 mod native_cut_graph;
 use feynkit_graph::EdgeId;
+use idenso::tensor::SymbolicTensor;
 use native_cut_graph::{diagram, kinematics};
 use std::{collections::BTreeMap, sync::Arc};
 use symbolica::prelude::*;
@@ -38,7 +39,11 @@ fn prepared(family: &CutFamily, targets: &[Integral]) -> PreparedTwoBodyPhaseSpa
 #[test]
 fn native_builder_cut_orientation_and_numerator_reach_phase_space() {
     let graph = GraphIntegral::new(
-        Arc::new(diagram().with_numerator(Atom::num(7)).unwrap()),
+        Arc::new(
+            diagram()
+                .with_numerator(SymbolicTensor::infer(Atom::num(7)).unwrap())
+                .unwrap(),
+        ),
         &kinematics(),
     )
     .unwrap();
@@ -114,7 +119,7 @@ fn cut_cancellations_vanish_without_relabeling_the_native_basis() {
     let native = diagram.propagator_family(&kin).unwrap();
     let numerator = diagram
         .clone()
-        .with_numerator(native.denominators()[0].clone())
+        .with_numerator(SymbolicTensor::infer(native.denominators()[0].clone()).unwrap())
         .unwrap();
     let (family, terms) = convert(&GraphIntegral::new(Arc::new(numerator), &kin).unwrap());
     assert_eq!(family.family().physical_propagators, 2);

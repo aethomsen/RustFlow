@@ -60,9 +60,10 @@ serde_json = "1"
 # The native HEPKit renderer uses its maintained lean Typst components.
 typst-library = { git = "https://github.com/alphal00p/gammaloop", branch = "feynkit" }
 typst-svg = { git = "https://github.com/alphal00p/gammaloop", branch = "feynkit" }
-symbolica = { git = "https://github.com/symbolica-dev/symbolica", branch = "community" }
-numerica = { git = "https://github.com/symbolica-dev/symbolica", branch = "community" }
-graphica = { git = "https://github.com/symbolica-dev/symbolica", branch = "community" }
+# Current tensor zero checks and shared evaluator composition (Symbolica PR #99).
+symbolica = { git = "https://github.com/symbolica-dev/symbolica", branch = "codex/community-evaluator-composition" }
+numerica = { git = "https://github.com/symbolica-dev/symbolica", branch = "codex/community-evaluator-composition" }
+graphica = { git = "https://github.com/symbolica-dev/symbolica", branch = "codex/community-evaluator-composition" }
 
 symbolica-typst-plugin = { git = "https://github.com/symbolica-dev/symbolica-typst-plugin", rev = "57b7455b37c30f4f87353c0073e49f5225e937ab" }
 
