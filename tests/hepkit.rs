@@ -171,6 +171,32 @@ fn signed_numerators_and_native_tensor_contractions_reconstruct_the_integrand() 
 }
 
 #[test]
+fn a_free_tensor_interface_is_rejected_even_when_its_expression_is_zero() {
+    let vector = spenso::vector_symbol!("rustflow_tensor_boundary::v")
+        .call(symbol!("spenso::mink").call(scalar("D_")));
+    let vector = idenso::tensor::SymbolicTensor::infer(vector).unwrap();
+    let zero = vector.with_checked_expression(Atom::Zero).unwrap();
+    let kin = kinematics(Atom::num(-1));
+    for numerator in [vector, zero] {
+        let diagram = feynkit_graph::FeynmanDiagram::from_dot(model(), BUBBLE)
+            .unwrap()
+            .with_numerator(numerator)
+            .unwrap();
+        let graph = GraphIntegral::new(Arc::new(diagram), &kin).unwrap();
+        assert!(matches!(
+            graph.integral_groups(
+                &KinematicPoint::default(),
+                symbol!("feynkit_graph::eps"),
+                4,
+                1000,
+                &RunContext::default(),
+            ),
+            Err(Error::Unsupported(message)) if message.contains("free tensor indices")
+        ));
+    }
+}
+
+#[test]
 fn exact_complex_native_bubble_reaches_the_automatic_solver_and_refines() {
     let s = Atom::num(symbolica::domains::float::Complex::new(
         Rational::from(-2),

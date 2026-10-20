@@ -200,11 +200,8 @@ impl HiggsJetAmplitude {
         };
         // Reduce connected tensor work before distributing products. Expansion
         // exposes deferred closed scopes for the final native reduction.
-        let scalar =
-            idenso::tensor::SymbolicTensor::<spenso::structure::partial::PartialStructure>::infer(
-                summed.expression().clone(),
-            )
-            .map_err(native_error)?
+        let scalar = summed
+            .expression()
             .simplify_algebra(&algebra)
             .map_err(native_error)?
             .expanded(None, false)

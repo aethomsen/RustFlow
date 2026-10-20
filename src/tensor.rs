@@ -113,10 +113,9 @@ impl TensorProjector {
                             a * dot(&hard_head.call(hard), &external_head.call(external))?,
                         )
                     })?;
-            let reduced = TensorReducer::new(dimension.clone())
-                .with_integrated_head(hard_head)
-                .reduce(numerator.as_view())
-                .map_err(native_error)?;
+            let reducer = TensorReducer::new(dimension.clone()).with_integrated_head(hard_head);
+            let numerator = reducer.admit(numerator).map_err(native_error)?;
+            let reduced = reducer.reduce(&numerator).map_err(native_error)?;
             if !reduced.is_fully_contracted() {
                 return Err(Error::Unsupported(
                     "native vacuum projector retained free indices".into(),
@@ -135,7 +134,7 @@ impl TensorProjector {
                     Ok((
                         coefficient.numerator.to_expression(),
                         coefficient.denominator.to_expression(),
-                        term.tensor().clone(),
+                        term.tensor().expression().clone(),
                     ))
                 })
                 .collect::<Result<Projection>>()?;

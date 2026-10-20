@@ -14,7 +14,7 @@ use feynkit_graph::{DiagramEndpoint, EdgeId, FeynmanDiagram, IntegralFamily as N
 use feynkit_kinematics::Kinematics;
 use feynkit_model::Model;
 use idenso::tensor::{AlgebraContraction, AlgebraSettings, SymbolicTensor};
-use spenso::{network::parsing::AtomStructureExt, structure::TensorStructure};
+use spenso::structure::TensorStructure;
 use std::{collections::BTreeMap, sync::Arc};
 use symbolica::domains::float::Complex;
 use symbolica::prelude::*;
@@ -381,14 +381,23 @@ impl GraphIntegral {
             &kinematics,
         )
         .map_err(input_error)?;
-        let projected = self.diagram.numerator()
-            * self.diagram.projector()
-            * self.diagram.numerator_prefactor()
-            * self.diagram.overall_factor();
+        let overall =
+            SymbolicTensor::infer(self.diagram.overall_factor().clone()).map_err(input_error)?;
+        let projected = self
+            .diagram
+            .numerator()
+            .multiply(self.diagram.projector())
+            .and_then(|tensor| tensor.multiply(self.diagram.numerator_prefactor()))
+            .and_then(|tensor| tensor.multiply(&overall))
+            .map_err(input_error)?;
         // Dimension labels are input data. Native parsing can already turn a
         // literal four-dimensional metric trace into the scalar 4, so rewriting
         // only the surviving slots would give inconsistent dimensional algebra.
-        if projected.with_lorentz_dimension(tensor_dimension.as_view()) != projected {
+        if projected
+            .with_lorentz_dimension(self.kinematics.dimension())
+            .map_err(input_error)?
+            != projected
+        {
             return Err(Error::Unsupported(
                 "numerator Lorentz indices must use the symbolic Kinematics dimension; fixed-dimensional tensor slots cannot be promoted after native parsing".into(),
             ));
@@ -396,8 +405,9 @@ impl GraphIntegral {
         let routed = self
             .diagram
             .loop_momentum_basis()
-            .route_expression(&projected);
-        let tensor = SymbolicTensor::infer(routed)
+            .route_expression(projected.expression());
+        let tensor = projected
+            .with_checked_expression(routed)
             .and_then(|t| t.simplify_algebra(&self.algebra))
             .and_then(|t| t.to_dots())
             .map_err(input_error)?;

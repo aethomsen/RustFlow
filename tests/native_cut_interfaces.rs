@@ -1,3 +1,4 @@
+use idenso::tensor::SymbolicTensor;
 #[path = "support/native_cut_graph.rs"]
 mod native_cut_graph;
 #[path = "support/native_mixed_cut_graph.rs"]
@@ -24,7 +25,11 @@ fn native_weighted_cut_dimension_contraction_and_independent_laurent_fit() -> Re
     let eps = Atom::var(epsilon());
     let dimension = Atom::var(symbol!("native_cut_test::D"));
     let graph = GraphIntegral::new(
-        Arc::new(diagram().with_numerator((dimension - 3) / eps).unwrap()),
+        Arc::new(
+            diagram()
+                .with_numerator(SymbolicTensor::infer((dimension - 3) / eps).unwrap())
+                .unwrap(),
+        ),
         &kinematics(),
     )?;
     let backend = RustRedBackend::default();
@@ -65,7 +70,11 @@ fn exact_point_is_applied_once_and_native_raised_cut_sign_is_retained() -> Resul
     let a = Atom::var(symbol!("native_cut_test::a"));
     let eps = Atom::var(epsilon());
     let graph = GraphIntegral::new(
-        Arc::new(diagram().with_numerator(a.clone()).unwrap()),
+        Arc::new(
+            diagram()
+                .with_numerator(SymbolicTensor::infer(a.clone()).unwrap())
+                .unwrap(),
+        ),
         &kinematics(),
     )?
     .with_powers(&BTreeMap::from([(EdgeId(1), 2)]))?;
@@ -176,7 +185,9 @@ fn cut_zero_rows_still_require_valid_measure_and_cancellation_propagates() -> Re
 fn native_cut_cli_roundtrip_uses_hepkit_dot_and_exact_samples() {
     let temporary = std::env::temp_dir().join(format!("native-cut-cli-{}", std::process::id()));
     std::fs::create_dir_all(&temporary).unwrap();
-    let graph = diagram().with_numerator(Atom::num(7)).unwrap();
+    let graph = diagram()
+        .with_numerator(SymbolicTensor::infer(Atom::num(7)).unwrap())
+        .unwrap();
     std::fs::write(temporary.join("cut.dot"), graph.to_dot().unwrap()).unwrap();
     let mut card = serde_json::json!({
         "schema_version": 1,
@@ -318,7 +329,11 @@ fn exact_complex_weights_survive_native_graph_encoding_and_direct_projection() -
     let weight = imaginary / Atom::var(epsilon());
     let plain = GraphIntegral::new(Arc::new(diagram()), &kinematics())?;
     let complex = GraphIntegral::new(
-        Arc::new(diagram().with_numerator(weight.clone()).unwrap()),
+        Arc::new(
+            diagram()
+                .with_numerator(SymbolicTensor::infer(weight.clone()).unwrap())
+                .unwrap(),
+        ),
         &kinematics(),
     )?;
     let backend = RustRedBackend::default();
